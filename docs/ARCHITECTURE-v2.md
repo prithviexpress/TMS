@@ -2,9 +2,9 @@
 
 ## Context & What Changed
 
-This revision incorporates 8 user-specified changes plus the detailed process flow (image 1) and enterprise feature list (image 2):
+This revision incorporates 8 user-specified changes plus detailed corrections:
 
-1. **Two ALPR + two LED**: One ALPR+LED at Gate, one ALPR+LED at Parking Exit
+1. **Two ALPR + two LED**: One ALPR+LED at Gate, one ALPR+LED at Parking Exit — both LEDs face **truck drivers**, showing plate-specific instructions
 2. **All trucks park first**: No truck goes direct to bay — mandatory parking stop; bay call triggered by schedule window
 3. **Material system entry at parking counter**: GR (Goods Receipt) entry done at parking, keyed by gate entry time
 4. **Multi-bay per truck**: One truck can serve multiple bays based on attached consignments
@@ -12,6 +12,11 @@ This revision incorporates 8 user-specified changes plus the detailed process fl
 6. **Device Management service**: Add/remove/configure/monitor all IoT devices
 7. **MQTT instead of Chirpstack webhook**: LoRaWAN sensor data arrives via MQTT (Mosquitto) not HTTP webhook
 8. **Enterprise-grade API security**: OAuth2 scopes, rate limiting, mTLS service mesh, audit log, OpenTelemetry
+
+**Per-bay hardware (corrected):**
+- 1 ultrasonic sensor per bay → occupancy state only (present/absent)
+- 1 Banner K70 light per bay → **Andon for bay operator/supervisor** (not truck driver)
+- LED displays are only at gate and parking exit — drivers are not inside the bay area
 
 ---
 
@@ -29,18 +34,20 @@ Truck Arrives at MSIL Gate
   │        └─ Delayed (< 0 Nagare time)? → Revise Worksheet:
   │             check vacant/urgent/emergency bays
   │
-  [GATE LED: "PROCEED TO PARKING P-{number}", gate entry timestamp logged]
+  [GATE LED displays truck plate + "PROCEED TO PARKING", gate entry timestamp logged]
+  │    ↑ This LED faces the driver. Message triggered by ALPR plate read.
   │
   ▼
 PARKING LOT  (all trucks wait here)
   │
-  ├─ Material System Entry at parking counter
-  │   └─ Entry identified by Gate Entry Time
-  │        └─ Clerk/operator scans/enters: vendor, part numbers, qty expected
+  ├─ Material System Entry at parking counter (clerk/operator terminal — Mendix)
+  │   └─ Entry identified by Gate Entry Time (timestamp, not plate — plate may be shared)
+  │        └─ Clerk enters: vendor, part numbers, qty expected per consignment
   │
   ├─ System monitors Bay/Time continuously
   │   ├─ < 15 mins to slot AND Bay VACANT → Call truck to bay
-  │   │    └─ LED at parking: "PROCEED TO BAY AR-N1 NOW"
+  │   │    └─ PARKING EXIT LED: "TRUCK {plate}: PROCEED TO BAY AR-N1"
+  │   │         ↑ Truck drives past parking exit LED on its way to bay
   │   │
   │   ├─ < 5 mins & Bay OCCUPIED → Check adjacent ±2 slots
   │   │    ├─ Unassigned slot found → redirect to alternate bay
@@ -66,14 +73,25 @@ PARKING EXIT
   └─ LED at parking exit: "THANK YOU — SAFE JOURNEY"
 ```
 
-### Bay Andon Color Scheme (K70 + Dashboard)
+### Bay Andon Color Scheme (K70 light — for bay **operator**, not driver)
 
-| Planned | Occupied | Warning | K70 Color | Mode |
-|---|---|---|---|---|
-| Yes | No | No | GREEN | Solid |
-| Yes | Yes | No | AMBER | Blinking |
-| No | Yes | Yes | RED | Solid |
-| No | No | No | OFF | — |
+The K70 light signals the OPERATOR/SUPERVISOR walking the bay floor about
+the status of the dock bay. It is NOT visible to the truck driver.
+
+| Planned | Occupied | Warning condition | K70 Color | Mode | Meaning |
+|---|---|---|---|---|---|
+| Yes | Yes | None | GREEN | Solid | Normal unloading in progress |
+| Yes | Yes | 8 mins left in slot | AMBER | Blinking | Slot ending soon — operator action needed |
+| No | Yes | Overstay | RED | Blinking | Truck occupying unscheduled — alert supervisor |
+| Yes | No | Late (truck not arrived) | BLUE | Blinking | Planned truck is late — follow up |
+| No | No | — | BLUE | Solid | Bay free, no booking — standby |
+
+**Warning trigger logic (schedule-service):**
+- `8 mins left`: `slot_end - now < 8 minutes AND status = AT_BAY`
+- `Overstay`: `now > slot_end AND bay still occupied`
+- `Late`: `slot_start < now AND bay still vacant AND consignment status != COMPLETED`
+
+K70 state is recomputed every 60 seconds by schedule-service and pushed via `tms.bay.andon_update` NATS event → display-service sets the physical light.
 
 ---
 
@@ -199,19 +217,38 @@ CREATE TABLE truck_visits (
 
 ### 6. `display-service` (port 8006) — UPDATED
 
+**Hardware managed:**
+- **2 LED displays** (driver-facing): `GATE_ENTRY` and `PARKING_EXIT` — JSON payload to `/spi/screen/message`
+- **160 K70 bay lights** (operator-facing Andon) — HTTP to Banner wireless gateway
+
+**LED display role:** Shows truck-plate-specific instructions to the driver.
+**K70 light role:** Signals bay operator of scheduling/timing abnormalities.
+
 **Changes:**
-- 4 hardware endpoints: GATE LED, PARKING EXIT LED (for vehicles), PARKING INTERNAL LED (for trucks waiting), PARKING COUNTER display
-- K70 light control uses Andon color scheme (not just GREEN/OFF)
-- Batch light updates: one API call to set N lights simultaneously
-- Display command retry with exponential backoff
+- LED messages are always plate-specific: `{plate}` is populated from the ALPR event
+- K70 uses 5-state Andon scheme (Green/Amber-blink/Red-blink/Blue-blink/Blue-solid)
+- Batch light update: single API call to update N K70 lights atomically
+- Andon recompute driven by `tms.bay.andon_update` NATS events (published by schedule-service every 60s)
+- Display command retry with exponential backoff + `display_commands_log` audit trail
 
-**New endpoints:**
-- `POST /api/v1/display/lights/batch` — set many K70 lights atomically
-- `GET  /api/v1/display/lights/andon-status` — all 160 lights current Andon state
+**Endpoints:**
+- `POST /api/v1/display/led/{display_id}/message` — send plate-specific message to Gate or Parking Exit LED
+- `GET  /api/v1/display/led/{display_id}/status` — last sent message + timestamp
+- `POST /api/v1/display/lights/{bay_id}` — set K70 light state
+- `POST /api/v1/display/lights/batch` — set multiple K70 lights in one call
+- `GET  /api/v1/display/lights/andon-status` — all 160 lights current state
+- `GET  /api/v1/display/health`
 
-**New NATS events consumed:**
-- `tms.schedule.sla_breach` → flash red on parking display + SMS supervisor
-- `tms.schedule.call_to_bay` → parking LED "PROCEED TO BAY AR-N1"
+**NATS events consumed:**
+
+| Event | LED action | K70 action |
+|---|---|---|
+| `tms.gate.truck_at_gate` (allowed) | Gate LED: "{plate}: PROCEED TO PARKING" | — |
+| `tms.gate.truck_at_gate` (hold >60min) | Gate LED: "{plate}: WAIT — SLOT IN {N} MINS" | — |
+| `tms.gate.truck_at_gate` (reject) | Gate LED: "{plate}: ENTRY NOT ALLOWED" | — |
+| `tms.schedule.call_to_bay` | Parking Exit LED: "{plate}: BAY {bay_code}" | K70 on bay: GREEN solid |
+| `tms.bay.andon_update` | — | K70 on bay: per Andon scheme |
+| `tms.bay.vacated` | — | K70 on bay: reset to BLUE solid (or planned state) |
 
 ---
 
@@ -393,38 +430,69 @@ All services call `GET /api/v1/config/{namespace}` at startup and cache in Redis
 ## Hardware Topology (Revised)
 
 ```
-Plant Layout:
-                    ┌─────────────────────────────────────────────────┐
-                    │                                                   │
-  ┌─────────┐  ALPR │  ┌─────────────┐              ┌──────────────┐  │
-  │  Vendor │──cam──┼─►│  GATE ENTRY │              │  PARKING     │  │
-  │  Truck  │       │  │  LED display│              │  COUNTER     │  │
-  └────┬────┘       │  └─────────────┘              │  (material   │  │
-       │            │                                │  entry)      │  │
-       │            │  ┌──────────────────────────── ┤              │  │
-       ▼            │  │      PARKING LOT            └──────────────┘  │
-  Gate ALPR sends   │  │   (all trucks wait here)                       │
-  alpr.gate.events  │  │                                                │
-                    │  └────────────────────────────────────────────── ┤
-                    │                                                   │
-                    │  ┌──────────────────────────────────────────────┐│
-                    │  │              160 DOCK BAYS                    ││
-                    │  │  [Bay AR-N1][Bay AR-N2]...[Bay C8]            ││
-                    │  │  K70 lights    Milesight sensors              ││
-                    │  └──────────────────────────────────────────────┘│
-                    │                                                   │
-  Parking Exit ─────┼──► ALPR cam → alpr.parking_exit.events           │
-  LED display ──────┼──► Shows "THANK YOU" on exit                     │
-                    └─────────────────────────────────────────────────-┘
+Plant Layout (driver's path):
+
+  ┌─────────┐
+  │  Vendor │
+  │  Truck  │
+  └────┬────┘
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  GATE                                                            │
+  │  [ALPR cam] ──reads plate──► NATS: alpr.gate.events             │
+  │  [LED Display] ◄──message── "TRUCK KA01AB1234: PROCEED TO PARK" │
+  │    (driver-facing, triggered by ALPR read)                       │
+  └──────────────────────────┬──────────────────────────────────────┘
+                             │ truck enters plant
+                             ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PARKING LOT                                                     │
+  │  ┌──────────────┐  ← Clerk terminal (Mendix) — material entry   │
+  │  │  PARKING     │    keyed by gate entry time                    │
+  │  │  COUNTER     │                                                │
+  │  └──────────────┘                                                │
+  │  Trucks wait here until system calls them to bay                 │
+  └──────────────────────────┬──────────────────────────────────────┘
+                             │ system triggers < 15 mins to slot
+                             ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PARKING EXIT                                                    │
+  │  [ALPR cam] ──reads plate──► NATS: alpr.parking_exit.events     │
+  │  [LED Display] ◄──message── "TRUCK KA01AB1234: BAY AR-N1"       │
+  │    (driver-facing, shows bay assignment as truck exits parking)   │
+  └──────────────────────────┬──────────────────────────────────────┘
+                             │ truck drives to assigned bay
+                             ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  160 DOCK BAYS                                                   │
+  │                                                                  │
+  │  Each bay has:                                                   │
+  │  • 1 Ultrasonic sensor (Milesight EM400-MUD)                    │
+  │      → occupancy only (present/absent via distance threshold)    │
+  │      → data arrives via LoRaWAN → MQTT → bay-service            │
+  │  • 1 Banner K70 light                                            │
+  │      → Andon signal for BAY OPERATOR/SUPERVISOR (not driver)    │
+  │      → 5 states: Green/Amber-blink/Red-blink/Blue-blink/Blue    │
+  │                                                                  │
+  │  [AR-N1] [AR-N2] ... [ARC1] ... [C1] ... [C8] ...              │
+  │   🟢 sensor  💡K70    🟡 sensor  💡K70                          │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Device counts:**
-- 2 ALPR cameras (gate entry + parking exit)
-- 2 LED displays (gate + parking exit)
-- 1 internal parking display (calls trucks to bays)
-- 160 bay sensors (Milesight EM400-MUD via LoRaWAN/MQTT)
-- 160 K70 bay lights
-- 1 MQTT broker (Mosquitto) for LoRaWAN sensor data
+**Device inventory (complete):**
+
+| Device | Count | Purpose | Audience |
+|---|---|---|---|
+| ALPR camera — Gate | 1 | Reads plate on entry | System automation |
+| ALPR camera — Parking Exit | 1 | Reads plate on bay call | System automation |
+| LED display — Gate | 1 | Instructs driver | **Truck driver** |
+| LED display — Parking Exit | 1 | Shows bay assignment | **Truck driver** |
+| Ultrasonic bay sensor | 160 | Occupancy detection | System automation |
+| Banner K70 bay light | 160 | Andon status signal | **Bay operator/supervisor** |
+| MQTT broker (Mosquitto) | 1 | LoRaWAN sensor data ingestion | System infra |
+
+**No displays inside the bay area.** Drivers see instructions only at Gate and Parking Exit LEDs.
 
 ---
 
