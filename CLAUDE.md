@@ -7,8 +7,9 @@ MSIL (Maruti Suzuki India Limited) plant truck movement management system.
 
 - **Frontend**: Mendix (external — not in this repo)
 - **Backend**: 9 Python 3.12 FastAPI microservices (no Docker — native processes)
-- **Infra**: PostgreSQL 16, Redis 7, NATS 2.10 (JetStream), Mosquitto MQTT, Nginx/Kong, Prometheus+Grafana
-- **Process mgmt**: supervisord (dev), systemd (production)
+- **Infra**: PostgreSQL 16, Redis 7, NATS 2.10 (JetStream), Mosquitto MQTT, Nginx (reverse proxy + admin portal), Prometheus+Grafana
+- **Process mgmt**: supervisord (dev on Linux/WSL2), systemd (production Linux), NSSM (Windows — dev only)
+- **OS**: Production = Ubuntu Server 22.04 LTS. Dev = Linux or Windows via WSL2 (recommended)
 - **IoT**: Milesight EM400-MUD sensors via LoRaWAN → MQTT (Mosquitto)
 
 ## Commands
@@ -42,7 +43,7 @@ make nats-pub SUBJECT=alpr.gate.events MSG='{"plate":"KA01AB1234","direction":"e
 | auth-service         | 8007 |
 | device-service       | 8008 |
 | config-service       | 8009 |
-| Kong (API Gateway)   | 80 / 443 |
+| Nginx (API Gateway)  | 80 / 443 |
 | NATS                 | 4222 |
 | NATS monitoring      | 8222 |
 | PostgreSQL           | 5432 |
@@ -58,7 +59,7 @@ make nats-pub SUBJECT=alpr.gate.events MSG='{"plate":"KA01AB1234","direction":"e
 ```
 Mendix Frontend
      │ REST + JWT (Bearer)
-   Kong API Gateway (:80/443)
+   Nginx API Gateway (:80)
      │
      ├── /api/v1/gate/          → gate-service:8001
      ├── /api/v1/bays/          → bay-service:8002
@@ -159,3 +160,22 @@ This project uses [garrytan/gstack](https://github.com/garrytan/gstack) Claude C
 
 Copy `.env.example` to `.env` and fill in values before running `make up`.
 All production secrets must go through Vault — never in `.env` on production servers.
+
+## Windows Development (WSL2)
+
+TMS runs on Linux. For Windows developer machines, use WSL2:
+
+```powershell
+# One-time setup (run in PowerShell as Administrator)
+wsl --install -d Ubuntu-22.04
+# After reboot, open Ubuntu terminal and run:
+sudo apt update && sudo apt install -y python3.12 python3.12-venv postgresql redis-server mosquitto
+# Then clone the repo inside WSL2 and follow normal Linux setup
+```
+
+**Why not native Windows:**
+- Redis has no official Windows port (last official build was v3.x in 2016)
+- supervisord uses Unix process signals (not available natively on Windows)
+- WSL2 gives a full Ubuntu environment with zero performance penalty for Python workloads
+
+**Production servers must be Linux** (Ubuntu Server 22.04 LTS recommended).

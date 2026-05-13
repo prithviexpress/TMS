@@ -30,26 +30,28 @@ Add test to `services/schedule-service/app/tests/test_sla_monitor.py`.
 
 ---
 
-## TODO-2: Kong DB-less declarative config (kong.yml)
+## TODO-2: Nginx rate-limit tuning + TLS termination config
 
-**What:** Write `infrastructure/kong/kong.yml` that registers all 9 services as Kong
-upstreams, adds rate limiting plugins, and enables JWT verification at the gateway layer.
+**What:** Once all 9 services are stable, tune `infrastructure/nginx/conf.d/tms.conf`
+rate-limit burst values from current conservative defaults and add a TLS-terminating
+server block for production (`listen 443 ssl`).
 
-**Why:** Without the declarative config, Kong passes all traffic through with no auth
-and no rate limiting — a security gap in production. Every port/endpoint change currently
-requires manual Kong Admin API calls. kong.yml makes the gateway infra-as-code.
+**Why:** Current burst values (api:30, sensor:200, auth:10) are estimates. Real traffic
+profiling at the plant may show that legitimate ALPR bursts during a gate-open event
+exceed 200 req/min, or that the Mendix polling load requires a higher `api` burst.
+TLS config is needed before going live — plant IT requires HTTPS for all external traffic.
 
-**Pros:** Infra-as-code; enables rate limiting to protect MSG91/Twilio SMS budget;
-allows Kong to do JWT verification so internal services trust forwarded claims.
+**Pros:** No code changes — pure Nginx config. `nginx -t` validates before reload.
+Rate limits protect MSG91/Twilio SMS budget from runaway clients.
 
-**Cons:** Kong config changes require a `kong reload` (supervisord SIGHUP) — slight
-ops overhead vs just restarting a service.
+**Cons:** Rate-limit misconfigurations silently drop requests (HTTP 503) — must test
+with `wrk` or `locust` before applying to production.
 
-**Context:** Kong DB-less declarative mode requires `kong.yml` at startup (set via
-`KONG_DECLARATIVE_CONFIG` env var). Without it, Kong starts in passthrough mode.
-Target delivery: Phase 8 (Integration & Hardening), after all 9 services are stable
-on their port assignments.
+**Context:** TLS certificate: use Let's Encrypt (if internet-accessible) or plant CA.
+Add `ssl_certificate` + `ssl_certificate_key` directives to the production server block.
+Tune burst with load test: `wrk -t4 -c50 -d30s http://localhost/api/v1/bays`.
+Target delivery: Phase 13 (Load test + production hardening).
 
-**Depends on:** All 9 services deployed and stable.
+**Depends on:** All 9 services deployed and stable; plant CA or Let's Encrypt cert issued.
 
 ---

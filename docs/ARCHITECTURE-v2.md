@@ -522,8 +522,7 @@ No Docker. All services and infrastructure components run as native processes on
 | Redis 7 | `apt install redis-server` | systemd unit `redis-server` |
 | NATS 2.10 | Download binary from nats.io | systemd unit `nats-server` |
 | Mosquitto 2 | `apt install mosquitto` | systemd unit `mosquitto` |
-| Nginx 1.25 | `apt install nginx` | systemd unit `nginx` |
-| Kong 3.6 | `apt install kong` (Debian pkg) | systemd unit `kong` |
+| Nginx 1.25 | `apt install nginx` | systemd unit `nginx` (API gateway + admin portal) |
 | OTel Collector | Download binary from opentelemetry.io | systemd unit `otel-collector` |
 | Prometheus | Download binary from prometheus.io | systemd unit `prometheus` |
 | Grafana | `apt install grafana` | systemd unit `grafana-server` |
@@ -619,33 +618,22 @@ service:
 
 Each FastAPI service adds `opentelemetry-instrumentation-fastapi` + `opentelemetry-exporter-otlp`. Traces visible in Grafana Tempo.
 
-### Kong API Gateway
+### Nginx API Gateway
 
-Install: Follow official Kong Debian package (https://konghq.com/install).
+`infrastructure/nginx/conf.d/tms.conf` routes all `/api/v1/*` paths to the appropriate
+service on loopback. All 9 services bind to `127.0.0.1` — no direct external access.
 
-`/etc/kong/kong.yml` (declarative, DB-less mode):
-```yaml
-_format_version: "3.0"
-services:
-  - name: gate-service
-    url: http://localhost:8001
-    routes:
-      - paths: [/api/v1/gate]
-  # ... repeat per service
-plugins:
-  - name: jwt          # gateway-level JWT verification
-  - name: rate-limiting
-    config:
-      minute: 100
-  - name: prometheus   # request/response metrics
-```
+Rate limiting zones:
+- `api` — 60 req/min per IP (burst 30) — standard endpoints
+- `auth` — 20 req/min per IP (burst 10) — login/refresh (brute-force protection)
+- `sensor` — 600 req/min per IP (burst 200) — ALPR + LoRaWAN device uplinks
 
-Kong provides:
-- JWT verification at gateway level (removes per-service JWT re-validation overhead)
-- Rate limiting: `tms:write` → 100 req/min; `tms:admin` → 20 req/min; devices → 1000 req/min
-- IP allowlist for device API keys
-- Request/response logging to Prometheus
-- mTLS for service-to-service calls (optional, via Kong Mesh)
+Special handling:
+- `/api/v1/bays/events/stream` — `proxy_buffering off` + 3600s timeout for SSE
+- `/api/v1/schedule/nagare` — 60s read/send timeout for large Excel uploads
+- JWT verification stays in individual services via `shared/tms_shared/auth.py`
+
+Nginx also serves the admin portal on port 8080 (see `infrastructure/nginx/conf.d/admin.conf`).
 
 ---
 
@@ -688,7 +676,7 @@ Special endpoints:
 
 ### 4. Network security
 
-- All external traffic → Kong (TLS termination, port 443)
+- All external traffic → Nginx (TLS termination, port 443)
 - Internal service-to-service: loopback only (`127.0.0.1`), services bind to localhost not 0.0.0.0; external ports blocked by `ufw`
 - Secrets via HashiCorp Vault or Linux keyring — never in `.env` files on production
 - Database passwords rotated via Vault dynamic credentials
@@ -716,7 +704,7 @@ All POST/PATCH endpoints accept optional `Idempotency-Key` header:
 | auth-service | 8007 | Updated (enterprise) |
 | device-service | 8008 | **NEW** |
 | config-service | 8009 | **NEW** |
-| Kong (API Gateway) | 80/443 | Replaces nginx |
+| Nginx (API Gateway) | 80/443 | Reverse proxy + admin portal |
 | NATS | 4222 | — |
 | PostgreSQL | 5432 | — |
 | Redis | 6379 | — |
@@ -1031,7 +1019,7 @@ nats-pub:
 
 | Phase | What | Why first |
 |---|---|---|
-| 0 | Infrastructure: install Mosquitto, OTel Collector, Kong, NATS, Redis, PostgreSQL natively; write systemd units | Unblocks everything |
+| 0 | Infrastructure: install Mosquitto, OTel Collector, Nginx, NATS, Redis, PostgreSQL natively; write systemd units | Unblocks everything |
 | 1 | auth-service: OAuth2 scopes, API keys, audit log | Security foundation |
 | 2 | config-service | All other services depend on runtime config |
 | 3 | device-service | Device registry needed before ALPR/sensor integration |
@@ -1066,7 +1054,7 @@ nats-pub:
 | New: `services/config-service/` | Full new service |
 | New: `infrastructure/mosquitto/` | MQTT broker config |
 | New: `infrastructure/otel/` | OpenTelemetry collector config |
-| New: `infrastructure/kong/` | Kong gateway config |
+| `infrastructure/nginx/conf.d/tms.conf` | Updated — all 9 services, rate limiting zones, SSE handling |
 | `infrastructure/nginx/conf.d/admin.conf` | **NEW** — Admin portal vhost (Adminer + Swagger + Grafana) |
 | `infrastructure/nginx/admin-portal/index.html` | **NEW** — Static landing page linking all admin tools |
 | `infrastructure/nginx/admin.htpasswd` | **NEW** — HTTP Basic Auth credentials for admin portal |
