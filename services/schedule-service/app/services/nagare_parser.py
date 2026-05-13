@@ -1,11 +1,18 @@
 """Parse Excel/CSV Nagare schedule files into consignment dicts.
 
-Expected columns (case-insensitive, order-independent):
-    vendor_code  — MSIL vendor code
-    bay_code     — target unloading bay
-    slot_start   — HH:MM  (24-hour)
-    slot_end     — HH:MM  (24-hour)
-    part_numbers — comma-separated part numbers (optional)
+Expected columns map to real MSIL Nagare export field names:
+
+    Schedule_no   — Nagare system's own unique ID (e.g. "16P6412043310WR1")
+    Vendor_code   — MSIL vendor code (e.g. "K056")
+    Unloading_loc — target unloading bay (e.g. "WR-10"), also accepts bay_code
+    SupplyTime    — slot start time HH:MM (24-hour)
+    Nag_qty       — planned delivery quantity
+    Item          — part number (e.g. "64130M60T00")
+    Item_name     — part description (optional)
+    Type          — always "NAGARE", used for validation
+
+slot_end is not present in the source file; it defaults to slot_start + 1 hour
+unless overridden via the `default_slot_duration_minutes` parameter.
 """
 
 from __future__ import annotations
@@ -13,55 +20,79 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 import openpyxl
 
 logger = logging.getLogger(__name__)
 
-# Canonical column names (lower-cased header → canonical key)
 _COLUMN_ALIASES: dict[str, str] = {
+    # Schedule number
+    "schedule_no": "schedule_no",
+    "schedule no": "schedule_no",
+    "scheduleno": "schedule_no",
+    "schedule_no.": "schedule_no",
+    # Vendor
     "vendor_code": "vendor_code",
     "vendor code": "vendor_code",
     "vendorcode": "vendor_code",
+    # Bay / unloading location
+    "unloading_loc": "bay_code",
+    "unloading loc": "bay_code",
+    "unloadingloc": "bay_code",
     "bay_code": "bay_code",
     "bay code": "bay_code",
     "baycode": "bay_code",
     "bay": "bay_code",
+    "location": "bay_code",
+    # Supply time (slot start)
+    "supplytime": "slot_start",
+    "supply_time": "slot_start",
+    "supply time": "slot_start",
     "slot_start": "slot_start",
     "slot start": "slot_start",
-    "slotstart": "slot_start",
-    "start": "slot_start",
     "start_time": "slot_start",
+    "start": "slot_start",
+    # Slot end (optional — usually absent, derived from slot_start + 1h)
     "slot_end": "slot_end",
     "slot end": "slot_end",
-    "slotend": "slot_end",
-    "end": "slot_end",
     "end_time": "slot_end",
-    "part_numbers": "part_numbers",
-    "part numbers": "part_numbers",
-    "parts": "part_numbers",
-    "part_no": "part_numbers",
+    "end": "slot_end",
+    # Quantities
+    "nag_qty": "nag_qty",
+    "nag qty": "nag_qty",
+    "nagqty": "nag_qty",
+    "planned_qty": "nag_qty",
+    "qty": "nag_qty",
+    # Item / part
+    "item": "item_code",
+    "item_code": "item_code",
+    "part_no": "item_code",
+    "part no": "item_code",
+    "partno": "item_code",
+    "item_name": "item_name",
+    "item name": "item_name",
+    "itemname": "item_name",
+    "description": "item_name",
+    "part_name": "item_name",
+    # Schedule type (informational, not stored)
+    "type": "schedule_type",
 }
 
-_REQUIRED = {"vendor_code", "slot_start", "slot_end"}
+_REQUIRED = {"vendor_code", "slot_start"}
 
 
 def _parse_time(value: object) -> time:
     """Convert a cell value to :class:`datetime.time`.
 
-    Accepts:
-    - ``datetime.time`` (openpyxl sometimes returns these directly)
-    - ``datetime.datetime``
-    - ``str`` in HH:MM or HH:MM:SS format
-    - ``float`` Excel serial fraction (e.g. 0.375 = 09:00)
+    Accepts datetime.time, datetime.datetime, str (HH:MM / HH:MM:SS),
+    and float Excel serial fractions (e.g. 0.375 = 09:00).
     """
     if isinstance(value, time):
         return value
     if isinstance(value, datetime):
         return value.time()
     if isinstance(value, float):
-        # Excel stores times as fractional days
         total_seconds = int(round(value * 86400))
         hours, remainder = divmod(total_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -93,18 +124,17 @@ def _row_to_dict(
     col_map: dict[int, str],
     schedule_date: date,
     row_num: int,
+    default_slot_duration_minutes: int = 60,
 ) -> dict | None:
-    """Convert a raw row to a consignment dict.  Returns None for blank rows."""
+    """Convert a raw row to a consignment dict. Returns None for blank rows."""
     record: dict[str, object] = {}
     for idx, key in col_map.items():
         if idx < len(row_values):
             record[key] = row_values[idx]
 
-    # Skip blank rows
     if not any(v not in (None, "") for v in record.values()):
         return None
 
-    # Validate required fields
     missing = _REQUIRED - set(record.keys())
     if missing:
         logger.warning("Row %d: missing columns %s — skipped", row_num, missing)
@@ -117,52 +147,82 @@ def _row_to_dict(
 
     try:
         t_start = _parse_time(record["slot_start"])
-        t_end = _parse_time(record["slot_end"])
     except (ValueError, TypeError) as exc:
-        logger.warning("Row %d: bad time value — %s — skipped", row_num, exc)
+        logger.warning("Row %d: bad SupplyTime value — %s — skipped", row_num, exc)
         return None
 
     slot_start = datetime.combine(schedule_date, t_start)
-    slot_end = datetime.combine(schedule_date, t_end)
-    if slot_end <= slot_start:
-        # Handle overnight case (e.g. 23:00 → 01:00 next day)
-        from datetime import timedelta
-        slot_end += timedelta(days=1)
 
-    raw_parts = record.get("part_numbers", "") or ""
-    part_numbers = [p.strip() for p in str(raw_parts).split(",") if p.strip()]
+    if "slot_end" in record and record["slot_end"] not in (None, ""):
+        try:
+            t_end = _parse_time(record["slot_end"])
+            slot_end = datetime.combine(schedule_date, t_end)
+            if slot_end <= slot_start:
+                slot_end += timedelta(days=1)
+        except (ValueError, TypeError):
+            slot_end = slot_start + timedelta(minutes=default_slot_duration_minutes)
+    else:
+        slot_end = slot_start + timedelta(minutes=default_slot_duration_minutes)
+
+    schedule_no_raw = record.get("schedule_no")
+    schedule_no = str(schedule_no_raw).strip() if schedule_no_raw else None
+
+    nag_qty_raw = record.get("nag_qty")
+    nag_qty: int | None = None
+    if nag_qty_raw not in (None, ""):
+        try:
+            nag_qty = int(float(str(nag_qty_raw)))
+        except (ValueError, TypeError):
+            pass
+
+    item_code_raw = record.get("item_code")
+    item_code = str(item_code_raw).strip() if item_code_raw else None
+
+    item_name_raw = record.get("item_name")
+    item_name = str(item_name_raw).strip() if item_name_raw else None
 
     return {
+        "schedule_no": schedule_no,
         "vendor_code": vendor_code,
         "bay_code": str(record.get("bay_code") or "").strip() or None,
         "slot_start": slot_start,
         "slot_end": slot_end,
-        "part_numbers": part_numbers,
+        "item_code": item_code,
+        "item_name": item_name,
+        "nag_qty": nag_qty,
     }
 
 
-def parse_nagare_excel(file_bytes: bytes, schedule_date: date) -> list[dict]:
-    """Parse an Excel (.xlsx) or CSV file into a list of consignment dicts.
+def parse_nagare_excel(
+    file_bytes: bytes,
+    schedule_date: date,
+    default_slot_duration_minutes: int = 60,
+) -> list[dict]:
+    """Parse an Excel (.xlsx) or CSV Nagare file into a list of consignment dicts.
 
     Each returned dict has keys:
-        vendor_code, bay_code, slot_start, slot_end, part_numbers
+        schedule_no, vendor_code, bay_code, slot_start, slot_end,
+        item_code, item_name, nag_qty
 
     Args:
         file_bytes: Raw bytes of the uploaded file.
-        schedule_date: The date this schedule applies to (used to construct
-                       full slot datetimes from HH:MM times).
+        schedule_date: The date this schedule applies to.
+        default_slot_duration_minutes: Duration used when slot_end is absent
+            (default 60 minutes — one Nagare slot).
 
     Returns:
         A list of consignment dicts ready for DB insertion.
     """
-    # Detect format by magic bytes
     if file_bytes[:4] == b"PK\x03\x04":
-        return _parse_excel(file_bytes, schedule_date)
-    return _parse_csv(file_bytes, schedule_date)
+        return _parse_excel(file_bytes, schedule_date, default_slot_duration_minutes)
+    return _parse_csv(file_bytes, schedule_date, default_slot_duration_minutes)
 
 
-def _parse_excel(file_bytes: bytes, schedule_date: date) -> list[dict]:
-    """Parse .xlsx bytes."""
+def _parse_excel(
+    file_bytes: bytes,
+    schedule_date: date,
+    default_slot_duration_minutes: int,
+) -> list[dict]:
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.active
 
@@ -177,13 +237,12 @@ def _parse_excel(file_bytes: bytes, schedule_date: date) -> list[dict]:
     if not _REQUIRED.issubset(col_map.values()):
         found = set(col_map.values())
         raise ValueError(
-            f"Missing required columns: {_REQUIRED - found}. "
-            f"Found: {found}"
+            f"Missing required columns: {_REQUIRED - found}. Found: {found}"
         )
 
     results: list[dict] = []
     for row_num, row in enumerate(rows[1:], start=2):
-        record = _row_to_dict(list(row), col_map, schedule_date, row_num)
+        record = _row_to_dict(list(row), col_map, schedule_date, row_num, default_slot_duration_minutes)
         if record:
             results.append(record)
 
@@ -191,8 +250,11 @@ def _parse_excel(file_bytes: bytes, schedule_date: date) -> list[dict]:
     return results
 
 
-def _parse_csv(file_bytes: bytes, schedule_date: date) -> list[dict]:
-    """Parse CSV bytes (UTF-8 or latin-1)."""
+def _parse_csv(
+    file_bytes: bytes,
+    schedule_date: date,
+    default_slot_duration_minutes: int,
+) -> list[dict]:
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             text = file_bytes.decode(encoding)
@@ -213,13 +275,12 @@ def _parse_csv(file_bytes: bytes, schedule_date: date) -> list[dict]:
     if not _REQUIRED.issubset(col_map.values()):
         found = set(col_map.values())
         raise ValueError(
-            f"Missing required columns: {_REQUIRED - found}. "
-            f"Found: {found}"
+            f"Missing required columns: {_REQUIRED - found}. Found: {found}"
         )
 
     results: list[dict] = []
     for row_num, row in enumerate(rows[1:], start=2):
-        record = _row_to_dict(row, col_map, schedule_date, row_num)
+        record = _row_to_dict(row, col_map, schedule_date, row_num, default_slot_duration_minutes)
         if record:
             results.append(record)
 
