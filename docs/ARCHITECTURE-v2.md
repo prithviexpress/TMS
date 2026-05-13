@@ -496,75 +496,142 @@ Plant Layout (driver's path):
 
 ---
 
-## Infrastructure Changes
+## Infrastructure — Native Installation
 
-### New: Mosquitto MQTT Broker
+No Docker. All services and infrastructure components run as native processes on Linux (Ubuntu 22.04 LTS recommended) managed by **systemd** (production) and **supervisord** (development).
 
-```yaml
-# Add to docker-compose.yml
-mosquitto:
-  image: eclipse-mosquitto:2
-  ports:
-    - "1883:1883"
-    - "9883:9883"    # WebSocket for browser-based monitoring
-  volumes:
-    - ./infrastructure/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-    - mosquitto_data:/mosquitto/data
+### Installation summary
+
+| Component | Install method | Runs as |
+|---|---|---|
+| PostgreSQL 16 | `apt install postgresql-16` | systemd unit `postgresql` |
+| Redis 7 | `apt install redis-server` | systemd unit `redis-server` |
+| NATS 2.10 | Download binary from nats.io | systemd unit `nats-server` |
+| Mosquitto 2 | `apt install mosquitto` | systemd unit `mosquitto` |
+| Nginx 1.25 | `apt install nginx` | systemd unit `nginx` |
+| Kong 3.6 | `apt install kong` (Debian pkg) | systemd unit `kong` |
+| OTel Collector | Download binary from opentelemetry.io | systemd unit `otel-collector` |
+| Prometheus | Download binary from prometheus.io | systemd unit `prometheus` |
+| Grafana | `apt install grafana` | systemd unit `grafana-server` |
+| pgAdmin4 | `pip install pgadmin4` in admin venv | systemd unit `pgadmin4` |
+| Python services | `pip install -e .` per service venv | systemd unit per service |
+
+### Mosquitto MQTT Broker
+
+Install: `apt install mosquitto mosquitto-clients`
+
+`/etc/mosquitto/conf.d/tms.conf`:
 ```
-
-`mosquitto.conf`:
-```
-listener 1883
+listener 1883 0.0.0.0
 protocol mqtt
 allow_anonymous false
-password_file /mosquitto/config/passwd
+password_file /etc/mosquitto/passwd
 
-listener 9883
+listener 9883 0.0.0.0
 protocol websockets
 
 persistence true
-persistence_location /mosquitto/data/
+persistence_location /var/lib/mosquitto/
 log_type all
+log_dest file /var/log/mosquitto/mosquitto.log
 ```
 
-ALPR cameras publish to NATS directly (they run the NATS SDK or HTTP → NATS proxy). Bay sensors arrive via LoRaWAN gateway → MQTT.
+Create credentials: `mosquitto_passwd -c /etc/mosquitto/passwd tms_lorawan`
 
-### OpenTelemetry Collector (enterprise)
+ALPR cameras publish directly to NATS (via SDK or lightweight HTTP→NATS proxy script).
+Bay sensors arrive via LoRaWAN gateway → MQTT broker → bay-service subscriber.
 
+### NATS Server
+
+Install: Download `nats-server` binary from https://nats.io/download/
+
+`/etc/nats/nats-server.conf`:
+```
+port: 4222
+http_port: 8222
+jetstream {
+  store_dir: /var/lib/nats/jetstream
+  max_memory_store: 1GB
+  max_file_store: 10GB
+}
+```
+
+Systemd unit: `/etc/systemd/system/nats-server.service`
+```ini
+[Unit]
+Description=NATS Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/nats-server -c /etc/nats/nats-server.conf
+Restart=always
+User=nats
+
+[Install]
+WantedBy=multi-user.target
+```
+
+JetStream streams created at first service startup via `init_jetstream_streams(js)` in `shared/tms_shared/nats_client.py`.
+
+### OpenTelemetry Collector
+
+Install: Download `otelcol-contrib` binary from opentelemetry.io.
+
+`/etc/otel/otel-config.yaml`:
 ```yaml
-otel-collector:
-  image: otel/opentelemetry-collector-contrib:latest
-  volumes:
-    - ./infrastructure/otel/otel-config.yaml:/etc/otel/config.yaml:ro
-  ports:
-    - "4317:4317"    # OTLP gRPC
-    - "4318:4318"    # OTLP HTTP
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  otlp/tempo:
+    endpoint: localhost:9096     # Grafana Tempo
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
 ```
 
 Each FastAPI service adds `opentelemetry-instrumentation-fastapi` + `opentelemetry-exporter-otlp`. Traces visible in Grafana Tempo.
 
-### Kong API Gateway (replaces Nginx in production)
+### Kong API Gateway
 
+Install: Follow official Kong Debian package (https://konghq.com/install).
+
+`/etc/kong/kong.yml` (declarative, DB-less mode):
 ```yaml
-kong:
-  image: kong:3.6-alpine
-  environment:
-    KONG_DATABASE: "off"     # DB-less mode
-    KONG_DECLARATIVE_CONFIG: /kong/kong.yml
-  ports:
-    - "80:8000"
-    - "443:8443"
-    - "8001:8001"   # Kong Admin API
-  volumes:
-    - ./infrastructure/kong/kong.yml:/kong/kong.yml:ro
+_format_version: "3.0"
+services:
+  - name: gate-service
+    url: http://localhost:8001
+    routes:
+      - paths: [/api/v1/gate]
+  # ... repeat per service
+plugins:
+  - name: jwt          # gateway-level JWT verification
+  - name: rate-limiting
+    config:
+      minute: 100
+  - name: prometheus   # request/response metrics
 ```
 
 Kong provides:
-- JWT verification at gateway level (no service-to-service JWT re-validation overhead)
-- Rate limiting: `tms:write` endpoints — 100 req/min; `tms:admin` — 20 req/min; device endpoints — 1000 req/min
-- IP whitelist for device API keys
+- JWT verification at gateway level (removes per-service JWT re-validation overhead)
+- Rate limiting: `tms:write` → 100 req/min; `tms:admin` → 20 req/min; devices → 1000 req/min
+- IP allowlist for device API keys
 - Request/response logging to Prometheus
-- mTLS plugin for service-to-service calls
+- mTLS for service-to-service calls (optional, via Kong Mesh)
 
 ---
 
@@ -607,10 +674,11 @@ Special endpoints:
 
 ### 4. Network security
 
-- All external traffic → Kong (TLS termination)
-- Internal service-to-service: Docker network isolation, no external ports
-- Secrets via Docker secrets or Vault (not environment variables in production)
+- All external traffic → Kong (TLS termination, port 443)
+- Internal service-to-service: loopback only (`127.0.0.1`), services bind to localhost not 0.0.0.0; external ports blocked by `ufw`
+- Secrets via HashiCorp Vault or Linux keyring — never in `.env` files on production
 - Database passwords rotated via Vault dynamic credentials
+- `ufw` firewall: only ports 80, 443, 22 (SSH) open externally; all service ports (8001–8009) loopback-only
 
 ### 5. Idempotency
 
@@ -702,26 +770,55 @@ Tier-1/Tier-2 support. Protected by Nginx IP allowlist + HTTP Basic Auth.
 
 | Tool | URL | Who uses it |
 |---|---|---|
-| **Landing page** | `http://tms-admin.msil.local/` | Everyone (links to all tools) |
-| **DB Browser** (Adminer) | `http://tms-admin.msil.local/db/` | Developers, Tier-1 support |
-| **Swagger — gate** | `http://tms-admin.msil.local/api/gate/docs` | Developers, QA |
-| **Swagger — bay** | `http://tms-admin.msil.local/api/bay/docs` | |
-| **Swagger — schedule** | `http://tms-admin.msil.local/api/schedule/docs` | |
-| **Swagger — vendor** | `http://tms-admin.msil.local/api/vendor/docs` | |
-| **Swagger — notification** | `http://tms-admin.msil.local/api/notification/docs` | |
-| **Swagger — display** | `http://tms-admin.msil.local/api/display/docs` | |
-| **Swagger — auth** | `http://tms-admin.msil.local/api/auth/docs` | |
-| **Swagger — config** | `http://tms-admin.msil.local/api/config/docs` | |
-| **Swagger — device** | `http://tms-admin.msil.local/api/device/docs` | |
-| **Grafana** | `http://tms-admin.msil.local/grafana/` | Ops, developers |
-| **Prometheus** | `http://tms-admin.msil.local/prometheus/` | Developers |
-| **NATS Monitor** | `http://tms-admin.msil.local/nats/` | Developers |
+| **Landing page** | `http://tms-admin.msil.local:8080/` | Everyone (links to all tools) |
+| **DB Browser** (pgAdmin4) | `http://tms-admin.msil.local:8080/db/` | Developers, Tier-1 support |
+| **Swagger — gate** | `http://tms-admin.msil.local:8080/api/gate/docs` | Developers, QA |
+| **Swagger — bay** | `http://tms-admin.msil.local:8080/api/bay/docs` | |
+| **Swagger — schedule** | `http://tms-admin.msil.local:8080/api/schedule/docs` | |
+| **Swagger — vendor** | `http://tms-admin.msil.local:8080/api/vendor/docs` | |
+| **Swagger — notification** | `http://tms-admin.msil.local:8080/api/notification/docs` | |
+| **Swagger — display** | `http://tms-admin.msil.local:8080/api/display/docs` | |
+| **Swagger — auth** | `http://tms-admin.msil.local:8080/api/auth/docs` | |
+| **Swagger — config** | `http://tms-admin.msil.local:8080/api/config/docs` | |
+| **Swagger — device** | `http://tms-admin.msil.local:8080/api/device/docs` | |
+| **Grafana** | `http://tms-admin.msil.local:8080/grafana/` | Ops, developers |
+| **Prometheus** | `http://tms-admin.msil.local:8080/prometheus/` | Developers |
+| **NATS Monitor** | `http://tms-admin.msil.local:8080/nats/` | Developers |
 
-### DB Browser — Adminer
+### DB Browser — pgAdmin4
 
-Docker image `adminer:4-standalone`. Connects to the shared PostgreSQL instance via the
-Docker internal network. A read-only PostgreSQL user `tms_admin_ro` is pre-configured so
-support staff can browse and query any service DB without write access.
+pgAdmin4 is a pure-Python web application for PostgreSQL. Installed natively; Nginx proxies to it.
+
+```bash
+python3 -m venv /opt/tms-admin-venv
+/opt/tms-admin-venv/bin/pip install pgadmin4
+```
+
+`/etc/pgadmin4/config_local.py`:
+```python
+SERVER_MODE = True
+DEFAULT_SERVER = '127.0.0.1'
+DEFAULT_SERVER_PORT = 5050
+DATA_DIR = '/var/lib/pgadmin4'
+LOG_FILE = '/var/log/pgadmin4/pgadmin4.log'
+```
+
+Systemd unit: `infrastructure/systemd/pgadmin4.service`
+```ini
+[Unit]
+Description=pgAdmin4 DB Browser
+After=postgresql.service
+
+[Service]
+ExecStart=/opt/tms-admin-venv/bin/pgadmin4
+User=pgadmin
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Pre-configure a read-only PostgreSQL user so support staff can browse any service DB:
 
 ```sql
 -- infrastructure/postgres/init/01-create-databases.sql (addition)
@@ -732,52 +829,25 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO tms_admin_ro;
 CREATE USER tms_admin_reader WITH PASSWORD '${ADMIN_READER_PASSWORD}' IN ROLE tms_admin_ro;
 ```
 
-Adminer is **not** port-exposed directly — it is only reachable through the admin Nginx vhost,
-which enforces the IP allowlist and Basic Auth.
+pgAdmin4 binds to `127.0.0.1:5050` — only reachable through the Nginx admin vhost.
 
 ### Swagger UI — API Tester
 
-FastAPI auto-generates `/docs` (Swagger UI) and `/openapi.json` for every service.
-Nginx proxies `/api/{service}/docs` → the correct service container.
-Developers can execute live API calls (including auth-protected ones) directly from the browser.
-
-No additional backend code needed — this is pure Nginx routing.
+FastAPI auto-generates `/docs` (Swagger UI) and `/openapi.json` for every service at startup.
+No extra code needed — Nginx on the admin vhost proxies `/api/{service}/docs` to the correct
+service process on localhost. Developers execute live calls from the browser, including
+JWT-protected endpoints.
 
 ### Admin Landing Page
 
-Static HTML file (`infrastructure/nginx/admin-portal/index.html`) served by Nginx with no
-backend. Lists all tools with clickable links. No auth logic — security is at the Nginx layer.
-
-### Docker Compose additions
-
-```yaml
-adminer:
-  image: adminer:4-standalone
-  environment:
-    ADMINER_DEFAULT_SERVER: postgres
-    ADMINER_DESIGN: lucas        # clean flat theme
-    ADMINER_PLUGINS: tables-filter tinymce
-  networks: [tms]
-  # No ports: block exposed — access only via admin Nginx vhost
-  restart: unless-stopped
-
-admin-portal:
-  image: nginx:1.25-alpine
-  volumes:
-    - ./infrastructure/nginx/admin-portal:/usr/share/nginx/html:ro
-    - ./infrastructure/nginx/conf.d/admin.conf:/etc/nginx/conf.d/default.conf:ro
-    - ./infrastructure/nginx/admin.htpasswd:/etc/nginx/.htpasswd:ro
-  ports:
-    - "8080:80"
-  networks: [tms]
-  restart: unless-stopped
-```
+Static HTML file (`infrastructure/nginx/admin-portal/index.html`) served by the Nginx admin
+vhost. No backend process — just a file on disk listing all tools with links.
 
 ### Nginx admin vhost (`infrastructure/nginx/conf.d/admin.conf`)
 
 ```nginx
 server {
-    listen 80;
+    listen 8080;
     server_name tms-admin.msil.local;
 
     # Plant IT office subnet only
@@ -786,36 +856,159 @@ server {
 
     # HTTP Basic Auth
     auth_basic "TMS Admin Portal";
-    auth_basic_user_file /etc/nginx/.htpasswd;
+    auth_basic_user_file /etc/nginx/admin.htpasswd;
 
-    # Landing page
+    # Landing page (static HTML)
     location / {
-        root /usr/share/nginx/html;
+        root /opt/tms/infrastructure/nginx/admin-portal;
         index index.html;
     }
 
-    # Adminer DB browser
+    # pgAdmin4 DB browser (runs natively on port 5050)
     location /db/ {
-        proxy_pass http://adminer:8080/;
+        proxy_pass http://127.0.0.1:5050/;
         proxy_set_header Host $host;
+        proxy_set_header X-Script-Name /db;
     }
 
-    # Swagger UI — route /api/{service}/docs → service container
-    location ~ ^/api/gate/(.*)$       { proxy_pass http://gate-service:8001/$1; }
-    location ~ ^/api/bay/(.*)$        { proxy_pass http://bay-service:8002/$1; }
-    location ~ ^/api/schedule/(.*)$   { proxy_pass http://schedule-service:8003/$1; }
-    location ~ ^/api/vendor/(.*)$     { proxy_pass http://vendor-service:8004/$1; }
-    location ~ ^/api/notification/(.*)$ { proxy_pass http://notification-service:8005/$1; }
-    location ~ ^/api/display/(.*)$    { proxy_pass http://display-service:8006/$1; }
-    location ~ ^/api/auth/(.*)$       { proxy_pass http://auth-service:8007/$1; }
-    location ~ ^/api/device/(.*)$     { proxy_pass http://device-service:8008/$1; }
-    location ~ ^/api/config/(.*)$     { proxy_pass http://config-service:8009/$1; }
+    # Swagger UI — each service runs on localhost:{port}
+    location ~ ^/api/gate/(.*)$         { proxy_pass http://127.0.0.1:8001/$1; }
+    location ~ ^/api/bay/(.*)$          { proxy_pass http://127.0.0.1:8002/$1; }
+    location ~ ^/api/schedule/(.*)$     { proxy_pass http://127.0.0.1:8003/$1; }
+    location ~ ^/api/vendor/(.*)$       { proxy_pass http://127.0.0.1:8004/$1; }
+    location ~ ^/api/notification/(.*)$ { proxy_pass http://127.0.0.1:8005/$1; }
+    location ~ ^/api/display/(.*)$      { proxy_pass http://127.0.0.1:8006/$1; }
+    location ~ ^/api/auth/(.*)$         { proxy_pass http://127.0.0.1:8007/$1; }
+    location ~ ^/api/device/(.*)$       { proxy_pass http://127.0.0.1:8008/$1; }
+    location ~ ^/api/config/(.*)$       { proxy_pass http://127.0.0.1:8009/$1; }
 
-    # Observability stack
-    location /grafana/  { proxy_pass http://grafana:3000/; }
-    location /prometheus/ { proxy_pass http://prometheus:9090/; }
-    location /nats/     { proxy_pass http://nats:8222/; }
+    # Observability (all run natively on localhost)
+    location /grafana/    { proxy_pass http://127.0.0.1:3000/; }
+    location /prometheus/ { proxy_pass http://127.0.0.1:9090/; }
+    location /nats/       { proxy_pass http://127.0.0.1:8222/; }
 }
+```
+
+---
+
+## Process Management (no Docker)
+
+### Development — supervisord
+
+Install: `pip install supervisor`
+
+`supervisord.conf` (at TMS root):
+```ini
+[supervisord]
+nodaemon=false
+logfile=/tmp/tms-supervisord.log
+
+[program:gate-service]
+command=/opt/tms/services/gate-service/.venv/bin/uvicorn app.main:app --port 8001 --reload
+directory=/opt/tms/services/gate-service
+environment=PYTHONPATH="/opt/tms/shared"
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/tms/gate.err.log
+stdout_logfile=/var/log/tms/gate.out.log
+
+[program:bay-service]
+command=/opt/tms/services/bay-service/.venv/bin/uvicorn app.main:app --port 8002 --reload
+directory=/opt/tms/services/bay-service
+environment=PYTHONPATH="/opt/tms/shared"
+autostart=true
+autorestart=true
+
+# ... repeat for schedule(8003), vendor(8004), notification(8005),
+#     display(8006), auth(8007), device(8008), config(8009)
+
+[group:tms-services]
+programs=gate-service,bay-service,schedule-service,vendor-service,
+         notification-service,display-service,auth-service,device-service,config-service
+```
+
+Dev commands:
+```bash
+supervisord -c supervisord.conf          # start all
+supervisorctl stop all                   # stop all
+supervisorctl restart gate-service       # restart one service
+supervisorctl tail -f gate-service       # follow logs
+supervisorctl status                     # health check
+```
+
+### Production — systemd
+
+One unit file per service. Template at `infrastructure/systemd/tms-service@.service`:
+```ini
+[Unit]
+Description=TMS %i service
+After=network.target postgresql.service redis-server.service nats-server.service
+
+[Service]
+WorkingDirectory=/opt/tms/services/%i-service
+ExecStart=/opt/tms/services/%i-service/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port ${PORT} \
+    --workers 2
+EnvironmentFile=/etc/tms/%i.env
+User=tms
+Group=tms
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable: `systemctl enable --now tms-service@gate tms-service@bay ...`
+
+### Virtual environments (one per service)
+
+```bash
+# Setup script: scripts/setup-venvs.sh
+for svc in gate bay schedule vendor notification display auth device config; do
+    cd /opt/tms/services/$svc-service
+    python3.12 -m venv .venv
+    .venv/bin/pip install -e . -e ../../shared
+done
+```
+
+### Makefile (updated — no Docker)
+
+```makefile
+up:
+    supervisord -c supervisord.conf
+
+down:
+    supervisorctl stop all
+
+restart:
+    supervisorctl restart all
+
+logs:
+    supervisorctl tail -f
+
+status:
+    supervisorctl status
+
+migrate:
+    @for svc in gate bay schedule vendor notification display auth device config; do \
+        cd services/$$svc-service && ../.venv/bin/alembic upgrade head && cd ../..; \
+    done
+
+test:
+    @for svc in gate bay schedule vendor notification display auth device config; do \
+        cd services/$$svc-service && ../.venv/bin/pytest app/tests/ -v && cd ../..; \
+    done
+
+lint:
+    ruff check services/ shared/
+
+nats-streams:
+    nats stream list
+
+nats-pub:
+    nats pub $(SUBJECT) '$(MSG)'
 ```
 
 ---
@@ -824,7 +1017,7 @@ server {
 
 | Phase | What | Why first |
 |---|---|---|
-| 0 | Infrastructure: add Mosquitto, OTel Collector, Kong | Unblocks everything |
+| 0 | Infrastructure: install Mosquitto, OTel Collector, Kong, NATS, Redis, PostgreSQL natively; write systemd units | Unblocks everything |
 | 1 | auth-service: OAuth2 scopes, API keys, audit log | Security foundation |
 | 2 | config-service | All other services depend on runtime config |
 | 3 | device-service | Device registry needed before ALPR/sensor integration |
@@ -835,7 +1028,7 @@ server {
 | 8 | notification-service: new templates, SLA alerts | Alerts |
 | 9 | vendor-service: truck-visits view | Self-service |
 | 10 | Integration + OpenTelemetry instrumentation | Observability |
-| 11 | Admin portal: Adminer + Nginx admin vhost + landing page | Developer tooling |
+| 11 | Admin portal: pgAdmin4 + Nginx admin vhost + landing page | Developer tooling |
 | 12 | Mendix pages: Device Mgmt, Config, Journey Timeline | UX |
 | 13 | Load test, security pen test, production hardening | Ship |
 
@@ -845,7 +1038,9 @@ server {
 
 | File | Change |
 |---|---|
-| `docker-compose.yml` | Add mosquitto, otel-collector, config-service, device-service, kong, adminer, admin-portal |
+| `supervisord.conf` | **NEW** — dev process manager for all 9 services + NATS stream init |
+| `Procfile` | **NEW** — alternative: `honcho start` runs all services for dev |
+| `infrastructure/systemd/` | **NEW** — production systemd unit files for all services + infra |
 | `shared/tms_shared/models/events.py` | Add CallToBayEvent, SLABreachEvent, DeviceOfflineEvent |
 | `services/gate-service/app/services/gate_logic.py` | Redis fallback, idempotency, dual ALPR routing |
 | `services/bay-service/app/services/occupancy.py` | Andon color logic, debounce, MQTT subscriber |
@@ -861,4 +1056,4 @@ server {
 | `infrastructure/nginx/conf.d/admin.conf` | **NEW** — Admin portal vhost (Adminer + Swagger + Grafana) |
 | `infrastructure/nginx/admin-portal/index.html` | **NEW** — Static landing page linking all admin tools |
 | `infrastructure/nginx/admin.htpasswd` | **NEW** — HTTP Basic Auth credentials for admin portal |
-| `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role for Adminer |
+| `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role for pgAdmin4 |
