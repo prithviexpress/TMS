@@ -1,0 +1,1 @@
+"""Display-service Pydantic schemas."""

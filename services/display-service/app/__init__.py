@@ -1,0 +1,1 @@
+"""Display-service application package."""

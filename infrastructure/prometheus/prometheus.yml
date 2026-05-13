@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: gate-service
+    static_configs:
+      - targets: ['gate-service:8001']
+    metrics_path: /metrics
+
+  - job_name: bay-service
+    static_configs:
+      - targets: ['bay-service:8002']
+    metrics_path: /metrics
+
+  - job_name: schedule-service
+    static_configs:
+      - targets: ['schedule-service:8003']
+    metrics_path: /metrics
+
+  - job_name: vendor-service
+    static_configs:
+      - targets: ['vendor-service:8004']
+    metrics_path: /metrics
+
+  - job_name: notification-service
+    static_configs:
+      - targets: ['notification-service:8005']
+    metrics_path: /metrics
+
+  - job_name: display-service
+    static_configs:
+      - targets: ['display-service:8006']
+    metrics_path: /metrics
+
+  - job_name: auth-service
+    static_configs:
+      - targets: ['auth-service:8007']
+    metrics_path: /metrics
+
+  - job_name: nats
+    static_configs:
+      - targets: ['nats:8222']
+    metrics_path: /metrics
