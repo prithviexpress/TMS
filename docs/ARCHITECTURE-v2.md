@@ -91,7 +91,7 @@ the status of the dock bay. It is NOT visible to the truck driver.
 - `Overstay`: `now > slot_end AND bay still occupied`
 - `Late`: `slot_start < now AND bay still vacant AND consignment status != COMPLETED`
 
-K70 state is recomputed every 60 seconds by schedule-service and pushed via `tms.bay.andon_update` NATS event → display-service sets the physical light.
+K70 state is recomputed every 60 seconds by schedule-service. **Diff-based publishing:** schedule-service tracks the previous Andon state per bay in Redis (`andon:{bay_code}:state`). It only publishes `tms.bay.andon_update` for bays whose state CHANGED since last cycle. In steady state (no slot transitions) this is 0–5 updates per minute, not 160. A Redis flush triggers a full 160-light sync on the next cycle as recovery.
 
 ---
 
@@ -117,6 +117,8 @@ K70 state is recomputed every 60 seconds by schedule-service and pushed via `tms
 **NATS:**
 - Consumes: `alpr.gate.events`, `alpr.parking_exit.events`
 - Publishes: `tms.gate.truck_at_gate`, `tms.gate.truck_at_parking_exit`, `tms.gate.manual_entry`
+
+> **Implementation note:** `alpr.parking_exit.events` fires for two distinct situations — a truck leaving parking to go to a bay (mid-visit) AND a truck leaving the facility entirely. `gate_logic.py` must look up the truck_visit status (via schedule-service or Redis cache) to route correctly: `IN_PARKING + pending bay` → publish `tms.gate.truck_at_parking_exit`; `AT_BAY/PARTIAL/COMPLETED + no more bays` → publish `tms.gate.truck_departed`.
 
 ---
 
@@ -228,7 +230,7 @@ CREATE TABLE truck_visits (
 - LED messages are always plate-specific: `{plate}` is populated from the ALPR event
 - K70 uses 5-state Andon scheme (Green-solid/Amber-blink/Red-blink/Red-solid/Blue-solid)
 - Batch light update: single API call to update N K70 lights atomically
-- Andon recompute driven by `tms.bay.andon_update` NATS events (published by schedule-service every 60s)
+- Andon recompute driven by `tms.bay.andon_update` NATS events (diff-based: schedule-service publishes only bays whose state changed; Redis key `andon:{bay_code}:state` tracks previous state)
 - Display command retry with exponential backoff + `display_commands_log` audit trail
 
 **Endpoints:**
@@ -271,7 +273,7 @@ CREATE TABLE api_keys (
     key_hash VARCHAR(200) NOT NULL UNIQUE,  -- SHA-256 of raw key
     label VARCHAR(100),                     -- "ALPR Gate Camera", "Bay Sensor MQTT"
     scopes TEXT[],                          -- ['tms:read', 'tms:device:write']
-    device_id UUID FK device_registry(id),  -- optional link to device
+    device_id UUID,                          -- soft ref to device_registry(id) in tms_device DB — no FK (cross-DB)
     last_used_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ,                 -- NULL = never
     revoked_at TIMESTAMPTZ,
@@ -424,6 +426,14 @@ hardware:
 ```
 
 All services call `GET /api/v1/config/{namespace}` at startup and cache in Redis (key: `config:{namespace}`, TTL 60s). Mendix shows full config UI with validation.
+
+**Fallback / circuit-breaker pattern (mandatory):** Every service's `config.py` (pydantic-settings) defines hardcoded safe defaults for every configurable threshold. At startup, the service:
+1. Loads defaults from `Settings` (pydantic-settings / env vars)
+2. Attempts `GET /api/v1/config/{namespace}` with a 3s timeout
+3. If successful: overrides relevant Settings fields and writes to Redis
+4. If config-service unreachable: logs `WARNING: config-service unavailable, running on defaults` and continues
+
+On every Redis cache miss (TTL expired), the service retries config-service. If still unreachable, it continues on stale cached values (or defaults if cache also empty). This means config-service is a **non-critical dependency** — its absence degrades config changeability, not operational correctness.
 
 ---
 
@@ -1041,9 +1051,9 @@ nats-pub:
 | `supervisord.conf` | **NEW** — dev process manager for all 9 services + NATS stream init |
 | `Procfile` | **NEW** — alternative: `honcho start` runs all services for dev |
 | `infrastructure/systemd/` | **NEW** — production systemd unit files for all services + infra |
-| `shared/tms_shared/models/events.py` | Add CallToBayEvent, SLABreachEvent, DeviceOfflineEvent |
-| `services/gate-service/app/services/gate_logic.py` | Redis fallback, idempotency, dual ALPR routing |
-| `services/bay-service/app/services/occupancy.py` | Andon color logic, debounce, MQTT subscriber |
+| `shared/tms_shared/models/events.py` | Migration strategy: keep V1 class names as deprecated aliases (`TruckArrivedEvent = TruckAtGateEvent`); add V2 models (`TruckAtGateEvent`, `CallToBayEvent`, `SLABreachEvent`, `DeviceOfflineEvent`, `AndonUpdateEvent`) with a `version: int = 2` field; update services phase by phase; remove V1 aliases after all 9 services are on V2 |
+| `services/gate-service/app/services/gate_logic.py` | Redis fallback, idempotency, dual ALPR routing; **inject thresholds as params** (`too_early_minutes`, `too_late_minutes`) from Settings/config-service instead of module constants |
+| `services/bay-service/app/services/occupancy.py` | Andon color logic, debounce, MQTT subscriber; **inject shared `http_client`** into `process_sensor_update`, `assign_bay`, `release_bay` — remove per-call `httpx.AsyncClient()` pattern |
 | `services/schedule-service/app/models/consignment.py` | Add truck_visits table, received_qty, material_entry_time |
 | `services/schedule-service/app/services/conflict_resolver.py` | **NEW** — bay conflict resolution engine |
 | `services/schedule-service/app/services/sla_monitor.py` | **NEW** — background SLA breach checker |
@@ -1057,3 +1067,5 @@ nats-pub:
 | `infrastructure/nginx/admin-portal/index.html` | **NEW** — Static landing page linking all admin tools |
 | `infrastructure/nginx/admin.htpasswd` | **NEW** — HTTP Basic Auth credentials for admin portal |
 | `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role for pgAdmin4 |
+| `services/bay-service/app/tests/test_bays.py` | **[CRITICAL]** Add sensor debounce tests: 2/3 readings → no flip; 3/3 → state flip + NATS published; alternating readings → counter reset |
+| `services/schedule-service/app/tests/test_andon.py` | **NEW [CRITICAL]** All 5 Andon states with fixed datetimes: planned+occupied+none→GREEN; planned+occupied+8min→AMBER blink; unplanned+occupied→RED blink; planned+vacant+late→RED solid; unplanned+vacant→BLUE solid. Include boundary cases (exactly 8min, exactly slot_start) |
