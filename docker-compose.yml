@@ -22,6 +22,16 @@ services:
       timeout: 5s
       retries: 5
 
+  nats-init:
+    image: natsio/nats-box:latest
+    volumes:
+      - ./infrastructure/nats/init-streams.sh:/init-streams.sh:ro
+    entrypoint: ["/bin/sh", "/init-streams.sh"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: "no"
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -257,8 +267,8 @@ services:
 
   notification-service:
     build:
-      context: ./services/notification-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/notification-service/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://tms:${POSTGRES_PASSWORD}@postgres:5432/tms_notifications
       NATS_URL: nats://nats:4222
@@ -283,8 +293,8 @@ services:
 
   vendor-service:
     build:
-      context: ./services/vendor-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/vendor-service/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://tms:${POSTGRES_PASSWORD}@postgres:5432/tms_vendor
       NATS_URL: nats://nats:4222

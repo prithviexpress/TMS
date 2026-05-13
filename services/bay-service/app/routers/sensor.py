@@ -19,12 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
 
-from app.cache import get_redis
+from app.cache import get_bay_status, get_redis
 from app.config import settings
 from app.database import get_db
 from app.models.bay import Bay
 from app.models.sensor_reading import SensorReading
-from app.routers.bays import broadcast_bay_event, get_bay_status
+from app.routers.bays import broadcast_bay_event
 from app.schemas.sensor_ingest import ChirpstackPayload
 from app.services.occupancy import process_sensor_update
 from app.services.sensor_decoder import decode_chirpstack_payload

@@ -121,7 +121,7 @@ Vendor receives Nagare (production schedule)
 
 ## Skill routing (gstack)
 
-This project includes gstack skills in `.claude/skills/gstack/`.
+This project uses [garrytan/gstack](https://github.com/garrytan/gstack) Claude Code skills (installed at `~/.claude/skills/gstack/`) for AI-assisted development workflows.
 
 - Architecture / design → `/plan-eng-review`
 - Code review / diff → `/review`  
