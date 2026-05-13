@@ -170,7 +170,8 @@ class TestEvaluateTruckArrivalHold:
 
 
 class TestEvaluateTruckArrivalReject:
-    """Various rejection scenarios."""
+    """Rejection scenarios — note: lateness is NEVER a rejection reason at MSIL.
+    Rejection only occurs when the plate is not in the Nagare or has no active consignment."""
 
     @pytest.mark.asyncio
     async def test_reject_not_in_schedule_404(self):
@@ -186,8 +187,10 @@ class TestEvaluateTruckArrivalReject:
         assert result["minutes_to_slot"] is None
 
     @pytest.mark.asyncio
-    async def test_reject_too_late_31_minutes(self):
-        """Truck arrives 31 minutes after slot start → reject (too late)."""
+    async def test_allow_31_minutes_late(self):
+        """Truck arrives 31 minutes after slot start → allow (lateness never rejects at MSIL).
+        Bay conflict (if bay is now occupied) is resolved by schedule-service redirecting
+        the truck to an emergency bay."""
         slot_start = _NOW - timedelta(minutes=31)
         response = _make_mock_response(200, {
             "consignment_id": "00000000-0000-0000-0000-000000000007",
@@ -202,29 +205,30 @@ class TestEvaluateTruckArrivalReject:
 
         result = await evaluate_truck_arrival("MH02GH0001", _NOW, _SCHEDULE_URL, client)
 
-        assert result["action"] == "reject"
+        assert result["action"] == "allow"
         assert result["minutes_to_slot"] == -31
-        assert "late" in result["rejection_reason"].lower()
+        assert result["rejection_reason"] is None
 
     @pytest.mark.asyncio
-    async def test_reject_too_late_2_hours(self):
-        """Truck arrives 2 hours after slot start → reject."""
-        slot_start = _NOW - timedelta(hours=2)
+    async def test_allow_hours_late(self):
+        """Truck arrives 3h37m after slot start (like the real MSIL example) → allow."""
+        slot_start = _NOW - timedelta(hours=3, minutes=37)
         response = _make_mock_response(200, {
             "consignment_id": "00000000-0000-0000-0000-000000000008",
             "slot_start": slot_start.isoformat(),
             "slot_end": (slot_start + timedelta(hours=1)).isoformat(),
-            "bay_code": None,
-            "bay_id": None,
+            "bay_code": "WR-10",
+            "bay_id": "00000000-0000-0000-0000-000000000018",
             "vendor_id": "00000000-0000-0000-0000-000000000028",
             "status": "scheduled",
         })
         client = _make_http_client(response)
 
-        result = await evaluate_truck_arrival("MH02GH0002", _NOW, _SCHEDULE_URL, client)
+        result = await evaluate_truck_arrival("HR38Y2102", _NOW, _SCHEDULE_URL, client)
 
-        assert result["action"] == "reject"
-        assert result["minutes_to_slot"] == -120
+        assert result["action"] == "allow"
+        assert result["minutes_to_slot"] == -217
+        assert result["rejection_reason"] is None
 
     @pytest.mark.asyncio
     async def test_reject_no_active_consignment(self):
@@ -395,8 +399,8 @@ class TestMinutesToSlotCalculation:
         assert result["minutes_to_slot"] == 10
 
     @pytest.mark.asyncio
-    async def test_boundary_exactly_minus_30_minutes(self):
-        """Exactly -30 minutes (boundary): still allow."""
+    async def test_allow_30_minutes_late(self):
+        """30 minutes late → allow. Any lateness is allowed at MSIL."""
         slot_start = _NOW - timedelta(minutes=30)
         response = _make_mock_response(200, {
             "consignment_id": "00000000-0000-0000-0000-000000000016",
@@ -411,6 +415,5 @@ class TestMinutesToSlotCalculation:
 
         result = await evaluate_truck_arrival("MH02YZ0001", _NOW, _SCHEDULE_URL, client)
 
-        # -30 is NOT less than -30, so it should allow
         assert result["action"] == "allow"
         assert result["minutes_to_slot"] == -30

@@ -19,9 +19,11 @@ from app.models.truck_movement import TruckMovement
 
 logger = logging.getLogger(__name__)
 
-# Thresholds (in minutes)
-_TOO_EARLY_THRESHOLD = 60   # > 60 min before slot → hold
-_TOO_LATE_THRESHOLD = -30   # > 30 min after slot start → reject
+# Early-arrival hold threshold (minutes before slot).
+# Late arrivals are ALWAYS allowed — no rejection for lateness.
+# If the scheduled bay is occupied when a late truck is called, schedule-service
+# redirects it to an emergency bay via the conflict-resolution endpoint.
+_TOO_EARLY_THRESHOLD = 60   # > 60 min before slot → hold in parking
 
 
 async def evaluate_truck_arrival(
@@ -41,8 +43,11 @@ async def evaluate_truck_arrival(
 
     Returns:
         A dict with keys:
-        ``action`` (``"allow"`` | ``"hold"`` | ``"reject"``),
-        ``consignment_id``, ``bay_code``, ``bay_id``, ``vendor_id``,
+        ``action`` (``"allow"`` | ``"hold"`` | ``"reject"``).
+        ``"reject"`` only when plate is not in Nagare or has no active consignment —
+        never for lateness. Late trucks get ``"allow"``; bay conflict (occupied slot)
+        is resolved by schedule-service redirecting to an emergency bay.
+        Also: ``consignment_id``, ``bay_code``, ``bay_id``, ``vendor_id``,
         ``minutes_to_slot`` (int | None), ``nagare_slot_start`` (datetime | None),
         ``nagare_slot_end`` (datetime | None), ``rejection_reason`` (str | None).
     """
@@ -144,10 +149,9 @@ async def evaluate_truck_arrival(
     minutes_to_slot = int((slot_start - arrival_time).total_seconds() / 60)
 
     # Decision tree
-    if minutes_to_slot < _TOO_LATE_THRESHOLD:
-        action = "reject"
-        rejection_reason = f"Arrived too late (>{abs(_TOO_LATE_THRESHOLD)} min after slot)"
-    elif minutes_to_slot > _TOO_EARLY_THRESHOLD:
+    # Late arrivals are always allowed — bay conflict is resolved by schedule-service
+    # (redirects to emergency bay if the scheduled bay is now occupied).
+    if minutes_to_slot > _TOO_EARLY_THRESHOLD:
         action = "hold"
         rejection_reason = f"Arrived too early (>{_TOO_EARLY_THRESHOLD} min before slot)"
     else:

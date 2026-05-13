@@ -29,12 +29,14 @@ Truck Arrives at MSIL Gate
   │   └─ Plate not found? → Manual entry by Guard → Trial/Entry not allowed
   │
   ├─ Retrieve Vendor + Supply time
-  │   ├─ > 60 mins to slot → proceed to parking (early arrival)
-  │   └─ < 60 mins to slot → proceed to parking (within window)
-  │        └─ Delayed (< 0 Nagare time)? → Revise Worksheet:
-  │             check vacant/urgent/emergency bays
+  │   ├─ > 60 mins to slot → HOLD: "WAIT — SLOT IN {N} MINS" (gate LED)
+  │   │    └─ schedule-service re-evaluates when window opens → calls to bay
+  │   ├─ Within window → ALLOW: "PROCEED TO PARKING" (gate LED)
+  │   └─ Late (any amount) → ALLOW: "PROCEED TO PARKING" (gate LED)
+  │        └─ Late + bay occupied when called? → emergency bay assigned
+  │             (schedule-service conflict resolution — never rejected for lateness)
   │
-  [GATE LED displays truck plate + "PROCEED TO PARKING", gate entry timestamp logged]
+  [GATE LED: truck plate + action message. Gate entry timestamp logged for GR entry.]
   │    ↑ This LED faces the driver. Message triggered by ALPR plate read.
   │
   ▼
@@ -104,7 +106,9 @@ K70 state is recomputed every 60 seconds by schedule-service. **Diff-based publi
 **Changes:**
 - Now handles BOTH `alpr.gate.events` AND `alpr.parking_exit.events`
 - LED display IDs: `GATE_ENTRY` and `PARKING_EXIT` (both configurable)
-- All timing thresholds (60 min, 15 min, 5 min, 30 min late) fetched from config-service
+- Gate decision: **allow** (within/late) | **hold** (> 60 min early) | **reject** (not in Nagare / no active consignment)
+- **Late arrivals are NEVER rejected.** A truck that is late and finds its bay occupied is redirected to an emergency bay by schedule-service conflict resolution.
+- Early-arrival threshold (60 min) fetched from config-service; no "too late" threshold exists
 - Guard manual-entry fallback endpoint
 - Idempotent event processing (deduplicate by `camera_id + plate + ts` within 30s window)
 - Redis fallback: if schedule-service is unreachable, use last-known consignment state from cache
