@@ -83,7 +83,7 @@ the status of the dock bay. It is NOT visible to the truck driver.
 | Yes | Yes | None | GREEN | Solid | Normal unloading in progress |
 | Yes | Yes | 8 mins left in slot | AMBER | Blinking | Slot ending soon — operator action needed |
 | No | Yes | Overstay | RED | Blinking | Truck occupying unscheduled — alert supervisor |
-| Yes | No | Late (truck not arrived) | BLUE | Blinking | Planned truck is late — follow up |
+| Yes | No | Late (truck not arrived) | RED | Solid | Planned truck is late — follow up |
 | No | No | — | BLUE | Solid | Bay free, no booking — standby |
 
 **Warning trigger logic (schedule-service):**
@@ -226,7 +226,7 @@ CREATE TABLE truck_visits (
 
 **Changes:**
 - LED messages are always plate-specific: `{plate}` is populated from the ALPR event
-- K70 uses 5-state Andon scheme (Green/Amber-blink/Red-blink/Blue-blink/Blue-solid)
+- K70 uses 5-state Andon scheme (Green-solid/Amber-blink/Red-blink/Red-solid/Blue-solid)
 - Batch light update: single API call to update N K70 lights atomically
 - Andon recompute driven by `tms.bay.andon_update` NATS events (published by schedule-service every 60s)
 - Display command retry with exponential backoff + `display_commands_log` audit trail
@@ -688,6 +688,75 @@ tms.dlq.*                       (dead-letter queue for all failed messages)
 | Notification Logs | `GET /notifications/logs` |
 | SLA Alerts | `GET /gate/sla-alerts` |
 | User Management | `GET/POST/PUT /auth/users` |
+| **DB Table Viewer** | `GET /admin/tables` — list tables; `GET /admin/tables/{table}?page=&filter=` — paginated rows |
+| **API Tester** | `GET /admin/openapi-index` — links to each service Swagger UI; inline REST client widget |
+
+---
+
+## Admin & Developer Tools
+
+Two admin-only Mendix pages backed by a lightweight admin passthrough in **auth-service**
+(scope: `tms:admin` required for all endpoints below).
+
+### DB Table Viewer
+
+Read-only window into every service's database, useful for Tier-1 support without needing
+direct PostgreSQL access.
+
+**Endpoints (auth-service `/api/v1/admin/`):**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/tables` | Returns `[{service, db, table, row_count, last_updated}]` across all service DBs |
+| `GET` | `/admin/tables/{service}/{table}` | Paginated rows: `?page=1&page_size=50&filter=column:value` |
+| `GET` | `/admin/tables/{service}/{table}/{id}` | Single row by primary key |
+
+Implementation: auth-service maintains a read-only connection to each service's DB
+(separate read replica / same PG instance with read-only role `tms_admin_ro`).
+No write capability — admins use Mendix forms to call the actual service APIs.
+
+**DB read-only role** (`infrastructure/postgres/init/01-create-databases.sql` addition):
+```sql
+CREATE ROLE tms_admin_ro NOLOGIN;
+GRANT CONNECT ON DATABASE tms_gate, tms_bay, tms_schedule, tms_vendor,
+    tms_notifications, tms_display, tms_auth TO tms_admin_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tms_admin_ro;
+CREATE USER tms_admin_reader PASSWORD '...' IN ROLE tms_admin_ro;
+```
+
+### API Tester
+
+Mendix page embedding a simple REST client widget + links to each service's auto-generated
+Swagger UI (FastAPI `/docs`). No backend changes needed — Swagger is already exposed.
+
+**Service Swagger links (Mendix config page stores base URLs):**
+
+| Service | Swagger UI |
+|---|---|
+| gate-service | `http://tms.msil.local/api/v1/gate/docs` |
+| bay-service | `http://tms.msil.local/api/v1/bays/docs` |
+| schedule-service | `http://tms.msil.local/api/v1/schedule/docs` |
+| vendor-service | `http://tms.msil.local/api/v1/vendors/docs` |
+| notification-service | `http://tms.msil.local/api/v1/notifications/docs` |
+| display-service | `http://tms.msil.local/api/v1/display/docs` |
+| auth-service | `http://tms.msil.local/api/v1/auth/docs` |
+| config-service | `http://tms.msil.local/api/v1/config/docs` |
+| device-service | `http://tms.msil.local/api/v1/devices/docs` |
+
+**Inline REST client endpoint** (proxy — avoids CORS issues from Mendix browser):
+```
+POST /admin/api-proxy
+Body: { "method": "GET|POST|PATCH|DELETE", "service": "gate", "path": "/trucks", "body": {} }
+Returns: { "status_code": 200, "response": {...}, "latency_ms": 42 }
+```
+The proxy forwards the call using the admin's own JWT, so it respects all OAuth2 scopes.
+
+**Nginx route** for Swagger UIs (add to `infrastructure/nginx/conf.d/tms.conf`):
+```nginx
+location ~ ^/api/v1/(?<svc>[^/]+)/docs {
+    proxy_pass http://$svc-service:80xx/docs;
+}
+```
 
 ---
 
@@ -706,8 +775,9 @@ tms.dlq.*                       (dead-letter queue for all failed messages)
 | 8 | notification-service: new templates, SLA alerts | Alerts |
 | 9 | vendor-service: truck-visits view | Self-service |
 | 10 | Integration + OpenTelemetry instrumentation | Observability |
-| 11 | Mendix pages: Device Mgmt, Config, Journey Timeline | UX |
-| 12 | Load test, security pen test, production hardening | Ship |
+| 11 | auth-service: DB Table Viewer endpoints + API proxy | Admin tooling |
+| 12 | Mendix pages: Device Mgmt, Config, Journey Timeline, DB Viewer, API Tester | UX |
+| 13 | Load test, security pen test, production hardening | Ship |
 
 ---
 
@@ -728,3 +798,6 @@ tms.dlq.*                       (dead-letter queue for all failed messages)
 | New: `infrastructure/mosquitto/` | MQTT broker config |
 | New: `infrastructure/otel/` | OpenTelemetry collector config |
 | New: `infrastructure/kong/` | Kong gateway config |
+| `services/auth-service/app/routers/admin.py` | **NEW** — DB Table Viewer + API proxy endpoints |
+| `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role |
+| `infrastructure/nginx/conf.d/tms.conf` | Add Swagger UI proxy routes per service |
