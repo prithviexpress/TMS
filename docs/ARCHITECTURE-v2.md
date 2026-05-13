@@ -688,73 +688,133 @@ tms.dlq.*                       (dead-letter queue for all failed messages)
 | Notification Logs | `GET /notifications/logs` |
 | SLA Alerts | `GET /gate/sla-alerts` |
 | User Management | `GET/POST/PUT /auth/users` |
-| **DB Table Viewer** | `GET /admin/tables` — list tables; `GET /admin/tables/{table}?page=&filter=` — paginated rows |
-| **API Tester** | `GET /admin/openapi-index` — links to each service Swagger UI; inline REST client widget |
+| Notification Logs (detail) | `GET /notifications/logs/{id}` |
 
 ---
 
-## Admin & Developer Tools
+## Admin & Developer Web Portal
 
-Two admin-only Mendix pages backed by a lightweight admin passthrough in **auth-service**
-(scope: `tms:admin` required for all endpoints below).
+Separate browser-accessible tools served at `http://tms-admin.msil.local` (port 8080, internal
+plant network only). **Not embedded in Mendix.** Intended for plant IT, developers, and
+Tier-1/Tier-2 support. Protected by Nginx IP allowlist + HTTP Basic Auth.
 
-### DB Table Viewer
+### Tool Index
 
-Read-only window into every service's database, useful for Tier-1 support without needing
-direct PostgreSQL access.
-
-**Endpoints (auth-service `/api/v1/admin/`):**
-
-| Method | Path | Description |
+| Tool | URL | Who uses it |
 |---|---|---|
-| `GET` | `/admin/tables` | Returns `[{service, db, table, row_count, last_updated}]` across all service DBs |
-| `GET` | `/admin/tables/{service}/{table}` | Paginated rows: `?page=1&page_size=50&filter=column:value` |
-| `GET` | `/admin/tables/{service}/{table}/{id}` | Single row by primary key |
+| **Landing page** | `http://tms-admin.msil.local/` | Everyone (links to all tools) |
+| **DB Browser** (Adminer) | `http://tms-admin.msil.local/db/` | Developers, Tier-1 support |
+| **Swagger — gate** | `http://tms-admin.msil.local/api/gate/docs` | Developers, QA |
+| **Swagger — bay** | `http://tms-admin.msil.local/api/bay/docs` | |
+| **Swagger — schedule** | `http://tms-admin.msil.local/api/schedule/docs` | |
+| **Swagger — vendor** | `http://tms-admin.msil.local/api/vendor/docs` | |
+| **Swagger — notification** | `http://tms-admin.msil.local/api/notification/docs` | |
+| **Swagger — display** | `http://tms-admin.msil.local/api/display/docs` | |
+| **Swagger — auth** | `http://tms-admin.msil.local/api/auth/docs` | |
+| **Swagger — config** | `http://tms-admin.msil.local/api/config/docs` | |
+| **Swagger — device** | `http://tms-admin.msil.local/api/device/docs` | |
+| **Grafana** | `http://tms-admin.msil.local/grafana/` | Ops, developers |
+| **Prometheus** | `http://tms-admin.msil.local/prometheus/` | Developers |
+| **NATS Monitor** | `http://tms-admin.msil.local/nats/` | Developers |
 
-Implementation: auth-service maintains a read-only connection to each service's DB
-(separate read replica / same PG instance with read-only role `tms_admin_ro`).
-No write capability — admins use Mendix forms to call the actual service APIs.
+### DB Browser — Adminer
 
-**DB read-only role** (`infrastructure/postgres/init/01-create-databases.sql` addition):
+Docker image `adminer:4-standalone`. Connects to the shared PostgreSQL instance via the
+Docker internal network. A read-only PostgreSQL user `tms_admin_ro` is pre-configured so
+support staff can browse and query any service DB without write access.
+
 ```sql
+-- infrastructure/postgres/init/01-create-databases.sql (addition)
 CREATE ROLE tms_admin_ro NOLOGIN;
 GRANT CONNECT ON DATABASE tms_gate, tms_bay, tms_schedule, tms_vendor,
-    tms_notifications, tms_display, tms_auth TO tms_admin_ro;
+    tms_notifications, tms_display, tms_auth, tms_config, tms_device TO tms_admin_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO tms_admin_ro;
-CREATE USER tms_admin_reader PASSWORD '...' IN ROLE tms_admin_ro;
+CREATE USER tms_admin_reader WITH PASSWORD '${ADMIN_READER_PASSWORD}' IN ROLE tms_admin_ro;
 ```
 
-### API Tester
+Adminer is **not** port-exposed directly — it is only reachable through the admin Nginx vhost,
+which enforces the IP allowlist and Basic Auth.
 
-Mendix page embedding a simple REST client widget + links to each service's auto-generated
-Swagger UI (FastAPI `/docs`). No backend changes needed — Swagger is already exposed.
+### Swagger UI — API Tester
 
-**Service Swagger links (Mendix config page stores base URLs):**
+FastAPI auto-generates `/docs` (Swagger UI) and `/openapi.json` for every service.
+Nginx proxies `/api/{service}/docs` → the correct service container.
+Developers can execute live API calls (including auth-protected ones) directly from the browser.
 
-| Service | Swagger UI |
-|---|---|
-| gate-service | `http://tms.msil.local/api/v1/gate/docs` |
-| bay-service | `http://tms.msil.local/api/v1/bays/docs` |
-| schedule-service | `http://tms.msil.local/api/v1/schedule/docs` |
-| vendor-service | `http://tms.msil.local/api/v1/vendors/docs` |
-| notification-service | `http://tms.msil.local/api/v1/notifications/docs` |
-| display-service | `http://tms.msil.local/api/v1/display/docs` |
-| auth-service | `http://tms.msil.local/api/v1/auth/docs` |
-| config-service | `http://tms.msil.local/api/v1/config/docs` |
-| device-service | `http://tms.msil.local/api/v1/devices/docs` |
+No additional backend code needed — this is pure Nginx routing.
 
-**Inline REST client endpoint** (proxy — avoids CORS issues from Mendix browser):
+### Admin Landing Page
+
+Static HTML file (`infrastructure/nginx/admin-portal/index.html`) served by Nginx with no
+backend. Lists all tools with clickable links. No auth logic — security is at the Nginx layer.
+
+### Docker Compose additions
+
+```yaml
+adminer:
+  image: adminer:4-standalone
+  environment:
+    ADMINER_DEFAULT_SERVER: postgres
+    ADMINER_DESIGN: lucas        # clean flat theme
+    ADMINER_PLUGINS: tables-filter tinymce
+  networks: [tms]
+  # No ports: block exposed — access only via admin Nginx vhost
+  restart: unless-stopped
+
+admin-portal:
+  image: nginx:1.25-alpine
+  volumes:
+    - ./infrastructure/nginx/admin-portal:/usr/share/nginx/html:ro
+    - ./infrastructure/nginx/conf.d/admin.conf:/etc/nginx/conf.d/default.conf:ro
+    - ./infrastructure/nginx/admin.htpasswd:/etc/nginx/.htpasswd:ro
+  ports:
+    - "8080:80"
+  networks: [tms]
+  restart: unless-stopped
 ```
-POST /admin/api-proxy
-Body: { "method": "GET|POST|PATCH|DELETE", "service": "gate", "path": "/trucks", "body": {} }
-Returns: { "status_code": 200, "response": {...}, "latency_ms": 42 }
-```
-The proxy forwards the call using the admin's own JWT, so it respects all OAuth2 scopes.
 
-**Nginx route** for Swagger UIs (add to `infrastructure/nginx/conf.d/tms.conf`):
+### Nginx admin vhost (`infrastructure/nginx/conf.d/admin.conf`)
+
 ```nginx
-location ~ ^/api/v1/(?<svc>[^/]+)/docs {
-    proxy_pass http://$svc-service:80xx/docs;
+server {
+    listen 80;
+    server_name tms-admin.msil.local;
+
+    # Plant IT office subnet only
+    allow 10.0.1.0/24;
+    deny all;
+
+    # HTTP Basic Auth
+    auth_basic "TMS Admin Portal";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    # Landing page
+    location / {
+        root /usr/share/nginx/html;
+        index index.html;
+    }
+
+    # Adminer DB browser
+    location /db/ {
+        proxy_pass http://adminer:8080/;
+        proxy_set_header Host $host;
+    }
+
+    # Swagger UI — route /api/{service}/docs → service container
+    location ~ ^/api/gate/(.*)$       { proxy_pass http://gate-service:8001/$1; }
+    location ~ ^/api/bay/(.*)$        { proxy_pass http://bay-service:8002/$1; }
+    location ~ ^/api/schedule/(.*)$   { proxy_pass http://schedule-service:8003/$1; }
+    location ~ ^/api/vendor/(.*)$     { proxy_pass http://vendor-service:8004/$1; }
+    location ~ ^/api/notification/(.*)$ { proxy_pass http://notification-service:8005/$1; }
+    location ~ ^/api/display/(.*)$    { proxy_pass http://display-service:8006/$1; }
+    location ~ ^/api/auth/(.*)$       { proxy_pass http://auth-service:8007/$1; }
+    location ~ ^/api/device/(.*)$     { proxy_pass http://device-service:8008/$1; }
+    location ~ ^/api/config/(.*)$     { proxy_pass http://config-service:8009/$1; }
+
+    # Observability stack
+    location /grafana/  { proxy_pass http://grafana:3000/; }
+    location /prometheus/ { proxy_pass http://prometheus:9090/; }
+    location /nats/     { proxy_pass http://nats:8222/; }
 }
 ```
 
@@ -775,8 +835,8 @@ location ~ ^/api/v1/(?<svc>[^/]+)/docs {
 | 8 | notification-service: new templates, SLA alerts | Alerts |
 | 9 | vendor-service: truck-visits view | Self-service |
 | 10 | Integration + OpenTelemetry instrumentation | Observability |
-| 11 | auth-service: DB Table Viewer endpoints + API proxy | Admin tooling |
-| 12 | Mendix pages: Device Mgmt, Config, Journey Timeline, DB Viewer, API Tester | UX |
+| 11 | Admin portal: Adminer + Nginx admin vhost + landing page | Developer tooling |
+| 12 | Mendix pages: Device Mgmt, Config, Journey Timeline | UX |
 | 13 | Load test, security pen test, production hardening | Ship |
 
 ---
@@ -785,7 +845,7 @@ location ~ ^/api/v1/(?<svc>[^/]+)/docs {
 
 | File | Change |
 |---|---|
-| `docker-compose.yml` | Add mosquitto, otel-collector, config-service, device-service, kong |
+| `docker-compose.yml` | Add mosquitto, otel-collector, config-service, device-service, kong, adminer, admin-portal |
 | `shared/tms_shared/models/events.py` | Add CallToBayEvent, SLABreachEvent, DeviceOfflineEvent |
 | `services/gate-service/app/services/gate_logic.py` | Redis fallback, idempotency, dual ALPR routing |
 | `services/bay-service/app/services/occupancy.py` | Andon color logic, debounce, MQTT subscriber |
@@ -798,6 +858,7 @@ location ~ ^/api/v1/(?<svc>[^/]+)/docs {
 | New: `infrastructure/mosquitto/` | MQTT broker config |
 | New: `infrastructure/otel/` | OpenTelemetry collector config |
 | New: `infrastructure/kong/` | Kong gateway config |
-| `services/auth-service/app/routers/admin.py` | **NEW** — DB Table Viewer + API proxy endpoints |
-| `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role |
-| `infrastructure/nginx/conf.d/tms.conf` | Add Swagger UI proxy routes per service |
+| `infrastructure/nginx/conf.d/admin.conf` | **NEW** — Admin portal vhost (Adminer + Swagger + Grafana) |
+| `infrastructure/nginx/admin-portal/index.html` | **NEW** — Static landing page linking all admin tools |
+| `infrastructure/nginx/admin.htpasswd` | **NEW** — HTTP Basic Auth credentials for admin portal |
+| `infrastructure/postgres/init/01-create-databases.sql` | Add `tms_admin_ro` read-only role for Adminer |
