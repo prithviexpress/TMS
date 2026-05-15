@@ -512,79 +512,77 @@ Plant Layout (driver's path):
 
 ## Infrastructure — Native Installation
 
-No Docker. All services and infrastructure components run as native processes on Linux (Ubuntu 22.04 LTS recommended) managed by **systemd** (production) and **supervisord** (development).
+No Docker. All services and infrastructure components run as native Windows processes managed by **NSSM** (production Windows Services) and **Honcho** (development, reads `Procfile`).
 
 ### Installation summary
 
 | Component | Install method | Runs as |
 |---|---|---|
-| PostgreSQL 16 | `apt install postgresql-16` | systemd unit `postgresql` |
-| Redis 7 | `apt install redis-server` | systemd unit `redis-server` |
-| NATS 2.10 | Download binary from nats.io | systemd unit `nats-server` |
-| Mosquitto 2 | `apt install mosquitto` | systemd unit `mosquitto` |
-| Nginx 1.25 | `apt install nginx` | systemd unit `nginx` (API gateway + admin portal) |
-| OTel Collector | Download binary from opentelemetry.io | systemd unit `otel-collector` |
-| Prometheus | Download binary from prometheus.io | systemd unit `prometheus` |
-| Grafana | `apt install grafana` | systemd unit `grafana-server` |
-| pgAdmin4 | `pip install pgadmin4` in admin venv | systemd unit `pgadmin4` |
-| Python services | `pip install -e .` per service venv | systemd unit per service |
+| PostgreSQL 16 | postgresql.org/download/windows | Windows Service (auto-registered by installer) |
+| Memurai (Redis) | memurai.com free tier | Windows Service (auto-registered by installer) |
+| NATS 2.10 | nats.io/download → `nats-server.exe` in PATH | NSSM unit `nats-server` |
+| Mosquitto 2 | mosquitto.org/download | Windows Service (auto-registered by installer) |
+| Nginx 1.25 | nginx.org/en/docs/windows.html | NSSM unit `nginx` |
+| OTel Collector | opentelemetry.io/docs/collector → `.exe` in PATH | NSSM unit `otel-collector` |
+| Prometheus | prometheus.io/download → `.exe` in PATH | NSSM unit `prometheus` |
+| Grafana | grafana.com/grafana/download?platform=windows | Windows Service (auto-registered by installer) |
+| pgAdmin4 | pgadmin.org/download/pgadmin-4-windows | Standalone app or NSSM |
+| Python services | `make setup` (creates `.venv` + installs deps) | NSSM unit per service (prod) / Honcho (dev) |
 
 ### Mosquitto MQTT Broker
 
-Install: `apt install mosquitto mosquitto-clients`
+Install: mosquitto.org/download (Windows installer registers as a Windows Service automatically).
 
-`/etc/mosquitto/conf.d/tms.conf`:
+`C:\Program Files\mosquitto\mosquitto.conf` (add at end):
 ```
 listener 1883 0.0.0.0
 protocol mqtt
 allow_anonymous false
-password_file /etc/mosquitto/passwd
+password_file C:\Program Files\mosquitto\passwd
 
 listener 9883 0.0.0.0
 protocol websockets
 
 persistence true
-persistence_location /var/lib/mosquitto/
+persistence_location C:\ProgramData\mosquitto\
 log_type all
-log_dest file /var/log/mosquitto/mosquitto.log
+log_dest file C:\ProgramData\mosquitto\mosquitto.log
 ```
 
-Create credentials: `mosquitto_passwd -c /etc/mosquitto/passwd tms_lorawan`
+Create credentials (run in cmd as Administrator):
+```
+mosquitto_passwd -c "C:\Program Files\mosquitto\passwd" tms_lorawan
+```
 
 ALPR cameras publish directly to NATS (via SDK or lightweight HTTP→NATS proxy script).
 Bay sensors arrive via LoRaWAN gateway → MQTT broker → bay-service subscriber.
 
 ### NATS Server
 
-Install: Download `nats-server` binary from https://nats.io/download/
+Install: Download `nats-server.exe` from nats.io/download, place in PATH.
 
-`/etc/nats/nats-server.conf`:
+Config (`infrastructure/nats/nats-server.conf`) — same file used at runtime:
 ```
 port: 4222
 http_port: 8222
 jetstream {
-  store_dir: /var/lib/nats/jetstream
+  store_dir: "./data/jetstream"
   max_memory_store: 1GB
   max_file_store: 10GB
 }
 ```
 
-Systemd unit: `/etc/systemd/system/nats-server.service`
-```ini
-[Unit]
-Description=NATS Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/nats-server -c /etc/nats/nats-server.conf
-Restart=always
-User=nats
-
-[Install]
-WantedBy=multi-user.target
+Register as Windows Service (run as Administrator):
+```powershell
+nssm install nats-server "C:\tools\nats-server.exe" "-c C:\TMS\infrastructure\nats\nats-server.conf"
+nssm set nats-server Start SERVICE_AUTO_START
+Start-Service nats-server
 ```
 
-JetStream streams created at first service startup via `init_jetstream_streams(js)` in `shared/tms_shared/nats_client.py`.
+JetStream streams: run once after first start:
+```powershell
+.\infrastructure\nats\init-streams.ps1
+```
 
 ### OpenTelemetry Collector
 

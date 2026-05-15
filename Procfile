@@ -1,0 +1,9 @@
+gate:         python scripts/run_service.py services/gate-service         .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+bay:          python scripts/run_service.py services/bay-service          .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload
+schedule:     python scripts/run_service.py services/schedule-service     .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8003 --reload
+vendor:       python scripts/run_service.py services/vendor-service       .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8004 --reload
+notification: python scripts/run_service.py services/notification-service .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8005 --reload
+display:      python scripts/run_service.py services/display-service      .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8006 --reload
+auth:         python scripts/run_service.py services/auth-service         .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8007 --reload
+device:       python scripts/run_service.py services/device-service       .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8008 --reload
+config:       python scripts/run_service.py services/config-service       .venv/Scripts/uvicorn app.main:app --host 127.0.0.1 --port 8009 --reload

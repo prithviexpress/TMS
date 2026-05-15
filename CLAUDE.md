@@ -7,19 +7,21 @@ MSIL (Maruti Suzuki India Limited) plant truck movement management system.
 
 - **Frontend**: Mendix (external — not in this repo)
 - **Backend**: 9 Python 3.12 FastAPI microservices (no Docker — native processes)
-- **Infra**: PostgreSQL 16, Redis 7, NATS 2.10 (JetStream), Mosquitto MQTT, Nginx (reverse proxy + admin portal), Prometheus+Grafana
-- **Process mgmt**: supervisord (dev on Linux/WSL2), systemd (production Linux), NSSM (Windows — dev only)
-- **OS**: Production = Ubuntu Server 22.04 LTS. Dev = Linux or Windows via WSL2 (recommended)
+- **Infra**: PostgreSQL 16, Memurai (Redis-compatible), NATS 2.10 (JetStream), Mosquitto MQTT, Nginx (reverse proxy + admin portal), Prometheus+Grafana
+- **Process mgmt**: Honcho (dev — reads Procfile), NSSM (production Windows Services)
+- **OS**: Production = Windows Server 2022. Dev = Windows 10/11 + Git for Windows
 - **IoT**: Milesight EM400-MUD sensors via LoRaWAN → MQTT (Mosquitto)
 
 ## Commands
 
+Run these from Git Bash (comes with Git for Windows):
+
 ```bash
-make up           # start all services via supervisord
-make down         # stop all services
-make restart      # restart all services
-make logs         # tail all logs (supervisorctl tail -f)
-make status       # show service health
+make setup        # create per-service .venv and install deps (first time only)
+make up           # start all 9 services via Honcho — Ctrl+C to stop
+make down         # kill orphaned uvicorn processes
+make logs         # tail NSSM log files (production)
+make status       # curl /health on all 9 services
 make migrate      # run alembic migrations on all services
 make seed         # seed bays + default admin user
 make test         # run pytest across all services
@@ -28,6 +30,9 @@ make lint         # ruff check all services
 # NATS debugging
 make nats-streams
 make nats-pub SUBJECT=alpr.gate.events MSG='{"plate":"KA01AB1234","direction":"entry","confidence":98.5,"camera_id":"gate","ts":"2026-05-13T10:00:00Z"}'
+
+# NATS streams init (run once after NATS starts)
+powershell -File infrastructure/nats/init-streams.ps1
 ```
 
 ## Service ports (all bind to 127.0.0.1 — loopback only)
@@ -161,21 +166,56 @@ This project uses [garrytan/gstack](https://github.com/garrytan/gstack) Claude C
 Copy `.env.example` to `.env` and fill in values before running `make up`.
 All production secrets must go through Vault — never in `.env` on production servers.
 
-## Windows Development (WSL2)
+## Windows Setup
 
-TMS runs on Linux. For Windows developer machines, use WSL2:
+TMS runs natively on Windows. No WSL2, no Docker required.
 
-```powershell
-# One-time setup (run in PowerShell as Administrator)
-wsl --install -d Ubuntu-22.04
-# After reboot, open Ubuntu terminal and run:
-sudo apt update && sudo apt install -y python3.12 python3.12-venv postgresql redis-server mosquitto
-# Then clone the repo inside WSL2 and follow normal Linux setup
+### One-time infrastructure install
+
+| Component | Download / Install |
+|---|---|
+| Python 3.12 | python.org/downloads |
+| Git for Windows | git-scm.com (includes Git Bash + `make`) |
+| PostgreSQL 16 | postgresql.org/download/windows |
+| Memurai (Redis) | memurai.com (free tier, Windows-native Redis) |
+| NATS 2.10 | nats.io/download → `nats-server.exe`, add to PATH |
+| NATS CLI | github.com/nats-io/natscli/releases → `nats.exe`, add to PATH |
+| Mosquitto 2 | mosquitto.org/download |
+| Nginx | nginx.org/en/docs/windows.html |
+| NSSM | nssm.cc/download (production service manager) |
+| Honcho | `pip install honcho` (dev process runner) |
+| Prometheus | prometheus.io/download |
+| Grafana | grafana.com/grafana/download?platform=windows |
+
+### First-time dev setup (Git Bash)
+
+```bash
+# 1. Clone repo and set up venvs
+git clone <repo>
+cd TMS
+make setup          # creates .venv + installs deps for all 9 services
+
+# 2. Copy and fill in .env
+cp .env.example .env
+
+# 3. Init DB
+make migrate
+make seed
+
+# 4. Init NATS streams (run once after nats-server.exe starts)
+powershell -File infrastructure/nats/init-streams.ps1
+
+# 5. Start all services (Ctrl+C to stop)
+make up
 ```
 
-**Why not native Windows:**
-- Redis has no official Windows port (last official build was v3.x in 2016)
-- supervisord uses Unix process signals (not available natively on Windows)
-- WSL2 gives a full Ubuntu environment with zero performance penalty for Python workloads
+### Production: register as Windows Services (NSSM)
 
-**Production servers must be Linux** (Ubuntu Server 22.04 LTS recommended).
+```powershell
+# Run as Administrator
+.\infrastructure\nssm\register-services.ps1
+
+# Start / stop all
+Get-Service TMS-* | Start-Service
+Get-Service TMS-* | Stop-Service
+```
